@@ -1,0 +1,168 @@
+{
+  "total": 20000,
+  "concurrency": 16,
+  "spread": [
+    {
+      "topic": "sw_spread_b1_1785512257",
+      "total_messages": 20000,
+      "batch_size": 1,
+      "concurrency": 16,
+      "value_bytes": 200,
+      "requests": 20000,
+      "acked_requests": 20000,
+      "acked_messages": 20000,
+      "elapsed_sec": 52.807,
+      "keyed": false,
+      "throughput_msgs_per_sec": 378.7,
+      "request_latency_ms": {
+        "p50": 39.95,
+        "p95": 67.94,
+        "p99": 78.97,
+        "p999": 96.49,
+        "max": 129.89
+      }
+    },
+    {
+      "topic": "sw_spread_b10_1785512310",
+      "total_messages": 20000,
+      "batch_size": 10,
+      "concurrency": 16,
+      "value_bytes": 200,
+      "requests": 2000,
+      "acked_requests": 1996,
+      "acked_messages": 19960,
+      "elapsed_sec": 69.749,
+      "keyed": false,
+      "throughput_msgs_per_sec": 286.2,
+      "request_latency_ms": {
+        "p50": 480.92,
+        "p95": 1042.38,
+        "p99": 1338.76,
+        "p999": 1780.81,
+        "max": 1979.45
+      }
+    },
+    {
+      "topic": "sw_spread_b100_1785512380",
+      "total_messages": 20000,
+      "batch_size": 100,
+      "concurrency": 16,
+      "value_bytes": 200,
+      "requests": 200,
+      "acked_requests": 198,
+      "acked_messages": 19800,
+      "elapsed_sec": 31.641,
+      "keyed": false,
+      "throughput_msgs_per_sec": 625.8,
+      "request_latency_ms": {
+        "p50": 2412.91,
+        "p95": 3838.18,
+        "p99": 4495.34,
+        "p999": 5547.57,
+        "max": 5547.57
+      }
+    },
+    {
+      "topic": "sw_spread_b1000_1785512412",
+      "total_messages": 20000,
+      "batch_size": 1000,
+      "concurrency": 16,
+      "value_bytes": 200,
+      "requests": 20,
+      "acked_requests": 20,
+      "acked_messages": 20000,
+      "elapsed_sec": 3.925,
+      "keyed": false,
+      "throughput_msgs_per_sec": 5095.4,
+      "request_latency_ms": {
+        "p50": 3039.14,
+        "p95": 3630.75,
+        "p99": 3630.75,
+        "p999": 3630.75,
+        "max": 3630.75
+      }
+    }
+  ],
+  "keyed": [
+    {
+      "topic": "sw_keyed_b1_1785512416",
+      "total_messages": 20000,
+      "batch_size": 1,
+      "concurrency": 16,
+      "value_bytes": 200,
+      "requests": 20000,
+      "acked_requests": 20000,
+      "acked_messages": 20000,
+      "elapsed_sec": 111.221,
+      "keyed": true,
+      "throughput_msgs_per_sec": 179.8,
+      "request_latency_ms": {
+        "p50": 82.11,
+        "p95": 150.69,
+        "p99": 205.03,
+        "p999": 323.93,
+        "max": 638.62
+      }
+    },
+    {
+      "topic": "sw_keyed_b10_1785512527",
+      "total_messages": 20000,
+      "batch_size": 10,
+      "concurrency": 16,
+      "value_bytes": 200,
+      "requests": 2000,
+      "acked_requests": 1999,
+      "acked_messages": 19990,
+      "elapsed_sec": 17.448,
+      "keyed": true,
+      "throughput_msgs_per_sec": 1145.7,
+      "request_latency_ms": {
+        "p50": 133.71,
+        "p95": 225.22,
+        "p99": 284.0,
+        "p999": 344.16,
+        "max": 382.16
+      }
+    },
+    {
+      "topic": "sw_keyed_b100_1785512544",
+      "total_messages": 20000,
+      "batch_size": 100,
+      "concurrency": 16,
+      "value_bytes": 200,
+      "requests": 200,
+      "acked_requests": 197,
+      "acked_messages": 19700,
+      "elapsed_sec": 1.954,
+      "keyed": true,
+      "throughput_msgs_per_sec": 10079.4,
+      "request_latency_ms": {
+        "p50": 146.91,
+        "p95": 225.68,
+        "p99": 277.27,
+        "p999": 390.55,
+        "max": 390.55
+      }
+    },
+    {
+      "topic": "sw_keyed_b1000_1785512546",
+      "total_messages": 20000,
+      "batch_size": 1000,
+      "concurrency": 16,
+      "value_bytes": 200,
+      "requests": 20,
+      "acked_requests": 20,
+      "acked_messages": 20000,
+      "elapsed_sec": 0.282,
+      "keyed": true,
+      "throughput_msgs_per_sec": 70867.4,
+      "request_latency_ms": {
+        "p50": 168.12,
+        "p95": 255.82,
+        "p99": 255.82,
+        "p999": 255.82,
+        "max": 255.82
+      }
+    }
+  ]
+}

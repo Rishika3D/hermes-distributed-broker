@@ -1,0 +1,26 @@
+server:
+  port: ${HERMES_REST_PORT:8081}
+
+spring:
+  application:
+    name: hermes-broker
+
+hermes:
+  broker-id: ${HERMES_BROKER_ID:1}
+  members: ${HERMES_MEMBERS:1@localhost:9091}
+  data-dir: ${HERMES_DATA_DIR:./data/broker-${HERMES_BROKER_ID:1}}
+  replication-factor: ${HERMES_REPLICATION_FACTOR:2}
+  default-partitions: ${HERMES_DEFAULT_PARTITIONS:3}
+  segment-bytes: ${HERMES_SEGMENT_BYTES:1048576}
+  cluster-secret: ${HERMES_CLUSTER_SECRET:}
+  api-key: ${HERMES_API_KEY:}
+  cors-origins: ${HERMES_CORS_ORIGINS:*}
+  acks: ${HERMES_ACKS:all}
+  group-commit: ${HERMES_GROUP_COMMIT:false}
+  linger-ms: ${HERMES_LINGER_MS:0}
+  batch-max-records: ${HERMES_BATCH_MAX_RECORDS:10000}
+
+logging:
+  level:
+    root: warn
+    org.springframework.boot: info

@@ -1,0 +1,11 @@
+target/
+data/
+.logs/
+node_modules/
+.next/
+__pycache__/
+.git/
+.github/
+.claude/
+docs/
+*.md
