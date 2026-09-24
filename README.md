@@ -1,12 +1,19 @@
 # Hermes
 
+[![CI](https://github.com/Rishika3D/hermes-distributed-broker/actions/workflows/ci.yml/badge.svg)](https://github.com/Rishika3D/hermes-distributed-broker/actions/workflows/ci.yml)
+![Java](https://img.shields.io/badge/Java-21-orange)
+![Spring Boot](https://img.shields.io/badge/Spring%20Boot-3.4-green)
+![Tests](https://img.shields.io/badge/tests-118%20passing-brightgreen)
+![Coverage](https://img.shields.io/badge/coverage-core%2089%25%20%7C%20rest%2095%25-brightgreen)
+
 A distributed message broker built from first principles in Java — topics, partitions,
 append-only log segments, consistent-hash partition placement, simplified Raft leader
 election, majority-ack replication, consumer groups with rebalancing, a Spring Boot
 REST layer, a Next.js telemetry dashboard, and a stdlib-only Python client.
 
-No Kafka libraries. Broker-to-broker traffic runs over raw Java sockets with a
-hand-rolled binary protocol.
+**No Kafka libraries, no messaging frameworks.** Broker-to-broker traffic runs over raw
+Java sockets with a hand-rolled binary protocol. The `hermes-core` engine has **zero
+runtime dependencies**.
 
 ```
                          ┌────────────────────────────┐
@@ -28,6 +35,78 @@ hand-rolled binary protocol.
                           replication, forwarded ops)
 ```
 
+---
+
+## Measured results
+
+> Every number below was produced by the harness in [`benchmarks/`](benchmarks/) or the
+> test suite — none are estimates. **Environment:** single 8-core / 8 GB macOS laptop
+> with all 3 broker JVMs *and* the load generator sharing the same cores and disk, so
+> these **understate** what dedicated hardware would give.
+
+### Throughput
+
+| Workload | Result |
+|---|---:|
+| Batched produce (1,000 msgs/request, durable) | **~220,000–310,000 msgs/sec** |
+| Single-message produce (durable, `acks=all`, c=800) | **4,419 msgs/sec** |
+| Read path — `GET /api/health` | **36,844 req/sec** |
+| Read path — `GET /api/metrics` | **20,260 req/sec** |
+
+### Why batching dominates — fsync amortisation
+
+20,000 messages, concurrency 16, RF=2, 24 partitions:
+
+| batch size | spread keys (round-robin) | keyed (same partition) |
+|---:|---:|---:|
+| 1 | 379 msgs/s | 180 msgs/s |
+| 10 | 286 msgs/s *(worse than 1)* | 1,146 msgs/s |
+| 100 | 626 msgs/s | 10,079 msgs/s |
+| 1,000 | 5,095 msgs/s | **70,867 msgs/s (187×)** |
+
+The honest finding: batching only helps when records land in the **same partition**. With
+null keys spread across 24 partitions, a batch of 10 becomes 10 single-record appends and
+is *slower* than no batching at all. Concentrated batches amortise one `fsync` across all
+1,000 records — that is the entire win.
+
+### Group commit — coalescing fsyncs across concurrent producers
+
+Hot single-partition topic, 32 concurrent single-message producers:
+
+| config | RF=1 | RF=2 |
+|---|---:|---:|
+| group commit **off** | 342 msgs/s | 180 msgs/s |
+| group commit **on** (`linger=2ms`) | **2,127 msgs/s (6.2×)** | **694 msgs/s (3.9×)** |
+
+Storage layer, verified in `GroupCommitTest`: **4,000 concurrent appends → 501 fsyncs
+(8.0× coalescing)** with every offset unique, contiguous, and durable.
+
+### Reliability & fault tolerance
+
+| Scenario | Result |
+|---|---|
+| Leader failover (`kill -9` controller → new leader elected) | **1,568 ms** |
+| Broker restart & WAL recovery (12 MB log, 16 segments) | **~2,009 ms** (JVM boot dominated; replay is negligible) |
+| Concurrency correctness (5,000 concurrent appends, 32 threads) | **5,000 unique contiguous offsets, 0 duplicates** |
+| Network partition (`SIGSTOP` a broker, then heal) | **No split-brain**, full recovery |
+| Protocol fuzzing (50,000 malformed frames) | **0 crashes, 0 hangs** |
+| Broker crash under load (`acks=all`) | Non-durable writes correctly **rejected with 503**, zero silent loss |
+
+### Bottleneck analysis — it is disk, not CPU
+
+| Measurement | Value |
+|---|---|
+| JVM CPU under peak write load | **66% of 800% available** (CPU largely idle) |
+| Disk during sustained write burst | **9,212 IOPS, 58.6 MB/s** while 27.9% CPU idle |
+| `fsync` latency (JFR, 16,699 events) | 2.88 ms isolated → **29.2 ms under contention** |
+| Hash-ring routing (hot path) | **164 ns/op** (0.007% of request cost) |
+
+Profiling with Java Flight Recorder showed threads almost never on-CPU — they block in
+`force()`. The system is **fsync-bound**, which is why batching and group commit (not
+more cores) are the levers that matter.
+
+---
+
 ## Architecture
 
 ### Storage: write-ahead log segments (`io.hermes.core.storage`)
@@ -35,12 +114,18 @@ hand-rolled binary protocol.
 Each partition is a `PartitionLog`: an ordered chain of append-only `LogSegment`
 files (`data/broker-N/<topic>-<partition>/00000000000000000000.log`). Records are
 binary-encoded by `RecordSerde` (offset, timestamp, key, value), appended
-sequentially, flushed per append, and never mutated. When the active segment
-exceeds `hermes.segment-bytes` (1 MiB default) it rolls to a new file named by its
-base offset. On startup segments are re-scanned to rebuild an in-memory
-`SparseIndex` (every 64th record → byte position), which also truncates torn
-trailing writes for free — reads seek to the nearest indexed position and scan
-forward.
+sequentially, **fsynced**, and never mutated. When the active segment exceeds
+`hermes.segment-bytes` (1 MiB default) it rolls to a new file named by its base
+offset. On startup segments are re-scanned to rebuild an in-memory `SparseIndex`
+(every 64th record → byte position), which also truncates torn trailing writes for
+free — reads seek to the nearest indexed position and scan forward.
+
+**Batching & group commit.** A batch of N records is written under one lock
+acquisition with a **single `fsync`** and replicated as **one frame**. Independently,
+`groupCommit` coalesces fsyncs across *concurrent* producers: writers append under a
+short lock, then a single flusher performs one `force()` covering all of them. A writer
+is released only once a flush that began *after* its write has completed — so durability
+is never weakened, only amortised.
 
 ### Partition placement: consistent hashing (`io.hermes.core.cluster`)
 
@@ -69,8 +154,8 @@ synchronously to every alive follower in the replica set and counts acks. The
 write is durable once a **majority of the replica set** (leader included) holds
 it — the Raft quorum rule applied per partition. Followers apply records with
 leader-assigned offsets (`appendAssigned`), which makes replication retries
-idempotent. Writes that miss quorum are surfaced in metrics as
-`underReplicatedWrites`.
+idempotent. Under `acks=all`, a write that misses quorum **fails with 503** rather
+than being silently acknowledged.
 
 ### Consumer groups (`io.hermes.core.group`)
 
@@ -80,16 +165,18 @@ every membership change (join, leave, 10 s session expiry) bumps the generation
 and re-runs **range assignment** — partitions split as evenly as possible, earlier
 joiners taking the extras. Clients detect a changed generation on join/heartbeat
 and pick up their new partitions. Committed offsets go through `OffsetStore`, an
-append-only text WAL replayed on startup.
+append-only WAL (fsynced per commit) replayed on startup. Offset commits are
+validated against the member's generation and ownership, so a zombie consumer that
+missed a rebalance cannot clobber another member's progress.
 
 ### Wire protocol (`io.hermes.core.net`)
 
-Every broker runs a `BrokerServer` (virtual-thread-per-connection) speaking
-length-free framed binary over `DataInput/OutputStream`: 1-byte opcode, string
-headers, optional record batch (`MessageCodec`). ~20 frame types cover votes,
-heartbeats, replication and forwarded client operations. `PeerClient` keeps one
-persistent, auto-reconnecting socket per peer with strict request/response
-semantics.
+Every broker runs a `BrokerServer` (virtual-thread-per-connection, with a bounded
+connection ceiling that sheds load) speaking framed binary over
+`DataInput/OutputStream`: 1-byte opcode, string headers, optional record batch
+(`MessageCodec`). ~20 frame types cover votes, heartbeats, replication and forwarded
+client operations. `PeerClient` maintains a pool of persistent, auto-reconnecting
+sockets per peer with strict request/response semantics.
 
 ### Request routing
 
@@ -124,6 +211,7 @@ hermes-core/     broker engine — plain Java 21, zero runtime dependencies
 hermes-rest/     Spring Boot REST layer (one process per broker node)
 dashboard/       Next.js telemetry dashboard (port 3000)
 clients/python/  stdlib-only client + end-to-end demo
+benchmarks/      reproducible throughput/latency harness + results
 scripts/         start/stop a local 3-node cluster
 ```
 
@@ -132,7 +220,7 @@ scripts/         start/stop a local 3-node cluster
 Prereqs: Java 21+, Maven 3.9+, Node 18+, Python 3.10+.
 
 ```bash
-# 1. build (runs the core test suite)
+# 1. build (runs the full test suite)
 mvn package
 
 # 2. start the 3-node cluster (REST :8081-8083, sockets :9091-9093)
@@ -152,7 +240,19 @@ cd dashboard && npm install && npm run dev
 
 Watch the failure modes live: `kill -9 $(cat .logs/broker-3.pid)` mid-demo —
 the dashboard flags the node, produces keep flowing to surviving partition
-leaders, and after ~2 s a new controller term appears if the controller died.
+leaders, and after ~1.6 s a new controller term appears if the controller died.
+
+### Reproducing the benchmarks
+
+```bash
+./scripts/start-cluster.sh
+python3 benchmarks/sweep.py 20000 16     # batch-size sweep, both workloads
+python3 benchmarks/bench.py --batch 1000 --concurrency 16 \
+        --out benchmarks/results/b1000.json
+```
+
+`benchmarks/OPTIMIZATION.md` documents the full before/after analysis, including the
+bugs that measurement uncovered.
 
 ### Single node
 
@@ -182,7 +282,8 @@ Configuration (env vars): `HERMES_BROKER_ID`, `HERMES_REST_PORT`,
 `HERMES_SEGMENT_BYTES` (1 MiB), `HERMES_CLUSTER_SECRET` (empty = wire auth off),
 `HERMES_API_KEY` (empty = REST auth off; sent as `X-API-Key`),
 `HERMES_CORS_ORIGINS` (`*`), `HERMES_ACKS` (`all` = quorum-durable, default;
-`leader` = ack on local append only).
+`leader` = ack on local append only), `HERMES_GROUP_COMMIT` (`false`),
+`HERMES_LINGER_MS` (`0`), `HERMES_BATCH_MAX_RECORDS` (`10000`).
 
 **Durability (`acks=all`, default):** a produce returns success only once a
 majority of the partition's replica set holds the record. If quorum cannot be
@@ -208,18 +309,19 @@ change the compose default.
 - **REST**: optional `HERMES_API_KEY` gates every endpoint except
   `/api/health`. CORS origins are configurable. Input is validated at the
   broker: topic/group names restricted to `[A-Za-z0-9._-]`, values ≤ 60 KB,
-  fetches clamped to 10k records, partition indexes bounds-checked.
+  fetches clamped by both record count and an 8 MB byte budget, partition
+  indexes bounds-checked.
 - Not provided (front with a real gateway if exposed publicly): TLS,
   per-client identity, rate limiting.
 
-### Testing
+## Testing
 
 `mvn verify` runs the full suite (**118 test methods**) and produces a JaCoCo
 coverage report. Measured coverage: **hermes-core 89% instructions / 79%
 branches, hermes-rest 95% / 82%**.
 
 ```bash
-mvn verify                                   # run all tests + coverage
+mvn verify                                       # run all tests + coverage
 open hermes-core/target/site/jacoco/index.html   # core coverage report
 open hermes-rest/target/site/jacoco/index.html   # REST coverage report
 mvn -pl hermes-rest test -Dtest=ProduceControllerTest   # run one test class
@@ -257,18 +359,35 @@ Deliberate trade-offs to keep the system understandable end to end:
   ring never moves, so there is no partition reassignment/data migration. Broker
   death is handled by liveness-aware replication and Raft re-election, not by
   re-placing partitions.
+- **No data-plane leader failover.** Partitions *led* by a crashed broker reject
+  writes until it returns (measured directly during chaos testing). Raft re-elects
+  the *controller* in ~1.6 s, but partition leadership follows the static ring.
+- **No follower catch-up.** A broker that was offline is not back-filled with the
+  writes it missed; replication is push-once. New writes become durable again as
+  soon as it rejoins.
 - **Metadata gossip instead of a replicated Raft log.** Topic creation converges
   via leader heartbeats; group *offsets* are durable on the controller's disk,
   but group *membership* resets if the controller changes (consumers transparently
-  rejoin).
-- **Fetches are served by any replica** and replication acks on receipt, so a
-  reader hitting a lagging follower can briefly see fewer messages than the
-  leader has (no high-watermark tracking).
-- **writeUTF framing** caps individual keys/values at 64 KiB; topic and group
-  names must avoid `, ; : @` characters.
-- **Flush-per-append, fsync on segment roll** — a middle ground between
-  throughput and durability; tune in `PartitionLog.appendAssigned` if you want
-  `force()` per write.
+  rejoin). Raft `term`/`votedFor` are held in memory, not persisted.
+- **Fetches are served by any replica** with no high-watermark tracking, so a
+  reader hitting a lagging follower can briefly see fewer messages than the leader.
+- **`writeUTF` framing** caps individual values at ~60 KB; topic and group names
+  are restricted to `[A-Za-z0-9._-]`.
+- **fsync on every append** (amortised by batching and group commit). This is
+  *stronger* per-message durability than Kafka's default, and is the primary reason
+  single-message throughput is in the thousands rather than the millions.
+
+### Roadmap
+
+The two changes that would move this from "correct" to "highly available":
+
+1. **Follower catch-up** via pull-based replication — lets a recovered broker
+   self-heal, and is a prerequisite for (2).
+2. **Data-plane leader failover** — promote an in-sync replica when a partition
+   leader dies, instead of rejecting writes until it returns.
+
+Then: persisted Raft state, batched replication frames, log retention/compaction,
+and a binary client protocol replacing JSON/HTTP.
 
 Each class in `hermes-core` carries one responsibility and the package
 boundaries (`storage`, `cluster`, `net`, `raft`, `replication`, `group`,
