@@ -3,22 +3,22 @@
 [![CI](https://github.com/Rishika3D/hermes-distributed-broker/actions/workflows/ci.yml/badge.svg)](https://github.com/Rishika3D/hermes-distributed-broker/actions/workflows/ci.yml)
 ![Java](https://img.shields.io/badge/Java-21-orange)
 ![Spring Boot](https://img.shields.io/badge/Spring%20Boot-3.4-green)
-![Tests](https://img.shields.io/badge/tests-118%20passing-brightgreen)
-![Coverage](https://img.shields.io/badge/coverage-core%2089%25%20%7C%20rest%2095%25-brightgreen)
+![Tests](https://img.shields.io/badge/tests-153%20passing-brightgreen)
+![Coverage](https://img.shields.io/badge/coverage-core%2089.5%25%20%7C%20rest%2092.9%25-brightgreen)
 
-A distributed message broker built from first principles in Java — topics, partitions,
-append-only log segments, consistent-hash partition placement, simplified Raft leader
-election, majority-ack replication, consumer groups with rebalancing, a Spring Boot
-REST layer, a Next.js telemetry dashboard, and a stdlib-only Python client.
+A distributed message broker built from first principles in Java: topics, partitions, append-only
+write-ahead-log segments, consistent-hash partition placement, simplified Raft leader election,
+majority-ack replication, consumer groups with rebalancing, a Spring Boot REST layer, a Next.js
+telemetry dashboard, and a stdlib-only Python client.
 
-**No Kafka libraries, no messaging frameworks.** Broker-to-broker traffic runs over raw
-Java sockets with a hand-rolled binary protocol. The `hermes-core` engine has **zero
-runtime dependencies**.
+**No Kafka libraries, no messaging frameworks.** Broker-to-broker traffic runs over raw Java sockets
+with a hand-rolled binary protocol. The `hermes-core` engine has **zero runtime dependencies**.
 
 ```
                          ┌────────────────────────────┐
    Next.js dashboard ───►│  REST API  (Spring Boot)   │   one per broker node
-   Python client    ───►│  hermes-rest :8081/2/3      │
+   (server-side poller)  │  hermes-rest :8081/2/3     │
+   Python client    ───►│                            │
                          └─────────────┬──────────────┘
                                        │ direct Java calls
                          ┌─────────────▼──────────────┐
@@ -35,75 +35,120 @@ runtime dependencies**.
                           replication, forwarded ops)
 ```
 
+## Contents
+
+[Measured results](#measured-results) · [Architecture](#architecture) · [Running locally](#running-locally) ·
+[Configuration](#configuration-reference) · [Production deployment](#production-deployment-guide) ·
+[Operations & troubleshooting](#operations--troubleshooting) · [Security](#security) ·
+[Testing](#testing) · [Hardening log](#hardening-log) · [Known limitations](#known-limitations)
+
 ---
 
 ## Measured results
 
-> Every number below was produced by the harness in [`benchmarks/`](benchmarks/) or the
-> test suite — none are estimates. **Environment:** single 8-core / 8 GB macOS laptop
-> with all 3 broker JVMs *and* the load generator sharing the same cores and disk, so
-> these **understate** what dedicated hardware would give.
+> Every number here came from the harness in [`benchmarks/`](benchmarks/), `autocannon`, JFR/`jcmd`,
+> or the test suite. **Environment:** one 8-core / 8 GB macOS laptop where all three broker JVMs *and*
+> the load generator share the same cores and a single SSD, so absolute numbers **understate**
+> dedicated hardware, and run-to-run variance is real (interleaved A/B runs below agree within ~2%;
+> runs hours apart, with different background load such as Spotlight indexing, differed by up to ~50%).
+> Use the *ratios and bottleneck analysis* as the reliable part. Numbers marked *(earlier session)*
+> were measured under different background load.
 
 ### Throughput
 
-| Workload | Result |
-|---|---:|
-| Batched produce (1,000 msgs/request, durable) | **~220,000–310,000 msgs/sec** |
-| Single-message produce (durable, `acks=all`, c=800) | **4,419 msgs/sec** |
-| Read path — `GET /api/health` | **36,844 req/sec** |
-| Read path — `GET /api/metrics` | **20,260 req/sec** |
+| Workload | Result | Setup |
+|---|---:|---|
+| Batched produce, keyed, 1,000 msgs/request | **71,591 msgs/s** | 3 nodes, RF=2, `acks=all`, 20k msgs, 16 concurrent |
+| Batched produce, 1,000 msgs/request *(earlier session)* | **~220,000–310,000 msgs/s** | `autocannon`, 1 node, RF=1, ~50 B values, 64–512 concurrent |
+| Single-message durable produce *(earlier session)* | **4,419 msgs/s** (collapses past ~800 connections) | `autocannon`, 1 node, RF=1, group commit on |
+| Single-message, hot partition, **group commit on** | **3,288 msgs/s** (p50 9.4 ms, p99 18.7 ms) | 1 node, RF=1, 32 concurrent producers |
+| Read path `GET /api/health` *(earlier session)* | 36,844 req/s | `autocannon`, parallel workers |
+| Read path `GET /api/metrics` *(earlier session)* | 20,260 req/s | same |
 
-### Why batching dominates — fsync amortisation
+### Batching: where the speedup comes from
 
-20,000 messages, concurrency 16, RF=2, 24 partitions:
+20,000 messages, concurrency 16, 3 nodes, RF=2, `acks=all`, 24 partitions (`benchmarks/sweep.py`):
 
-| batch size | spread keys (round-robin) | keyed (same partition) |
+| batch size | spread keys (round-robin) | keyed (one partition) |
 |---:|---:|---:|
-| 1 | 379 msgs/s | 180 msgs/s |
-| 10 | 286 msgs/s *(worse than 1)* | 1,146 msgs/s |
-| 100 | 626 msgs/s | 10,079 msgs/s |
-| 1,000 | 5,095 msgs/s | **70,867 msgs/s (187×)** |
+| 1 | 375 msgs/s | 193 msgs/s |
+| 10 | 264 msgs/s *(slower than 1)* | 1,213 msgs/s |
+| 100 | 594 msgs/s | 9,975 msgs/s |
+| 1,000 | 5,404 msgs/s | **71,591 msgs/s (371× batch=1)** |
 
-The honest finding: batching only helps when records land in the **same partition**. With
-null keys spread across 24 partitions, a batch of 10 becomes 10 single-record appends and
-is *slower* than no batching at all. Concentrated batches amortise one `fsync` across all
-1,000 records — that is the entire win.
+Batching only pays when records land in the **same partition**. With null keys spread over 24
+partitions a batch of 10 becomes ~10 single-record appends *and* waits on the slowest of them, so it is
+slower than not batching. A concentrated batch amortises one `fsync`, one replication frame and one HTTP
+round-trip across every record. The sweep reproduces within ~8% of the first run (spread 379/286/626/5,095;
+keyed 180/1,146/10,079/70,867).
 
-### Group commit — coalescing fsyncs across concurrent producers
+### Group commit: sharing fsyncs between concurrent producers
 
-Hot single-partition topic, 32 concurrent single-message producers:
+Hot single-partition topic, 32 concurrent single-message producers (`benchmarks/bench.py`):
 
-| config | RF=1 | RF=2 |
-|---|---:|---:|
-| group commit **off** | 342 msgs/s | 180 msgs/s |
-| group commit **on** (`linger=2ms`) | **2,127 msgs/s (6.2×)** | **694 msgs/s (3.9×)** |
+| config | group commit **off** | group commit **on** (linger 2 ms) | speedup |
+|---|---:|---:|---:|
+| 1 node, RF=1 | 338 msgs/s (p50 95 ms) | **3,288 / 3,283 msgs/s** (p50 9.4 ms) | **9.7×** |
+| 3 nodes, RF=2 | 182 msgs/s (p50 123 ms) | **825 / 611 msgs/s** (p50 33–40 ms) | **3.4–4.5×** |
 
-Storage layer, verified in `GroupCommitTest`: **4,000 concurrent appends → 501 fsyncs
-(8.0× coalescing)** with every offset unique, contiguous, and durable.
+RF=2 gains less because replication is still one synchronous frame per append, which group commit does
+not coalesce (only the leader's fsync is shared). Storage-layer proof (`GroupCommitTest`): **4,000
+concurrent appends → 502 fsyncs (8.0× coalescing)**, every offset unique, contiguous and durable.
+The coordination was refactored into its own class this release; an interleaved A/B against the previous
+implementation showed **no performance change** (old 3,359 / 3,330 vs new 3,315 / 3,361 msgs/s).
 
 ### Reliability & fault tolerance
 
 | Scenario | Result |
 |---|---|
 | Leader failover (`kill -9` controller → new leader elected) | **1,568 ms** |
-| Broker restart & WAL recovery (12 MB log, 16 segments) | **~2,009 ms** (JVM boot dominated; replay is negligible) |
-| Concurrency correctness (5,000 concurrent appends, 32 threads) | **5,000 unique contiguous offsets, 0 duplicates** |
-| Network partition (`SIGSTOP` a broker, then heal) | **No split-brain**, full recovery |
-| Protocol fuzzing (50,000 malformed frames) | **0 crashes, 0 hangs** |
-| Broker crash under load (`acks=all`) | Non-durable writes correctly **rejected with 503**, zero silent loss |
+| Broker restart & WAL recovery (12 MB log, 16 segments) | **~2,009 ms**, JVM/Spring boot dominated: an empty-data-dir start took 3.9 s in the same test, so WAL replay of 12 MB is below measurement noise |
+| 5,000 concurrent appends to one partition, 32 threads | **5,000 unique contiguous offsets, 0 duplicates**, all persisted |
+| Network partition (`SIGSTOP` a broker, then heal) | **No split-brain**; writes to healthy partitions kept succeeding; full recovery on heal |
+| Broker crash under load (`acks=all`) | Writes that cannot reach quorum are **rejected with 503**, never silently acknowledged |
+| Protocol fuzzing | 50,000 malformed frames, **0 crashes, 0 hangs** |
+| One 126 MB request against a 96 MB heap | **Before: broker killed (OOM). After: 413/closed, broker alive, `/api/health` 200** |
 
-### Bottleneck analysis — it is disk, not CPU
+### Resource utilisation (profiled with JFR, `jcmd`, `lsof`, `-Xlog:gc`)
+
+The write path is **disk-bound, not CPU-bound.**
 
 | Measurement | Value |
 |---|---|
-| JVM CPU under peak write load | **66% of 800% available** (CPU largely idle) |
-| Disk during sustained write burst | **9,212 IOPS, 58.6 MB/s** while 27.9% CPU idle |
-| `fsync` latency (JFR, 16,699 events) | 2.88 ms isolated → **29.2 ms under contention** |
-| Hash-ring routing (hot path) | **164 ns/op** (0.007% of request cost) |
+| JVM CPU, durable single-message writes | **42–66% of the 800% available** (cores mostly idle) |
+| JVM CPU, 1,000-msg batches | 76–186% avg (peak 459%) |
+| JVM CPU, `GET /api/health` (max HTTP load) | 291% avg (peak 425%); whole machine 12.6% idle |
+| Disk during a sustained write burst | **9,212 IOPS, 58.6 MB/s** with **27.9% CPU idle** |
+| `fsync` latency (JFR, 16,699 events) | 2.88 ms isolated → **29.2 ms mean under contention** (3 JVMs, one disk) |
+| Hash-ring routing (hot path) | **164 ns/op**, ~0.007% of a request |
 
-Profiling with Java Flight Recorder showed threads almost never on-CPU — they block in
-`force()`. The system is **fsync-bound**, which is why batching and group commit (not
-more cores) are the levers that matter.
+Threads sit blocked in `FileChannel.force()` rather than on-CPU, which is why batching and group commit
+(not more cores) are the levers that matter. On a production host with a dedicated NVMe per broker the
+fsync term shrinks by roughly the 10× seen between the isolated and contended measurements.
+
+**Soak (accelerated: 450 s, not 24 h)**, 3 brokers, 512 MB heap, sustained load at the saturation knee:
+
+| Metric | Observed |
+|---|---|
+| Heap used | sawtooth 39–187 MB, no upward trend |
+| Live set after forced full GC | **27 MB** |
+| Threads | constant **72** |
+| Open file descriptors | **87–107**, stable |
+| GC pauses | 28 pauses, mean 9.9 ms, **max 51.8 ms** |
+
+This rules out leaks that manifest within minutes. A real 12–24 h soak was **not** run (see limitations).
+
+**Saturation sweep** (single-message produce, 3 nodes, RF=2, 24 partitions; *earlier session*):
+
+| concurrency | msgs/s | p50 | p99 |
+|---:|---:|---:|---:|
+| 1 | 57 | 11 ms | 118 ms |
+| 16 | **422** | 35 ms | 80 ms |
+| 128 | 448 (peak) | 231 ms | 1,127 ms |
+| 384 | 284 (collapse) | 835 ms | 3,057 ms |
+
+Flat throughput with linearly rising latency past concurrency ≈16 is the signature of a serialised
+resource (the fsync queue), not CPU.
 
 ---
 
@@ -111,108 +156,99 @@ more cores) are the levers that matter.
 
 ### Storage: write-ahead log segments (`io.hermes.core.storage`)
 
-Each partition is a `PartitionLog`: an ordered chain of append-only `LogSegment`
-files (`data/broker-N/<topic>-<partition>/00000000000000000000.log`). Records are
-binary-encoded by `RecordSerde` (offset, timestamp, key, value), appended
-sequentially, **fsynced**, and never mutated. When the active segment exceeds
-`hermes.segment-bytes` (1 MiB default) it rolls to a new file named by its base
-offset. On startup segments are re-scanned to rebuild an in-memory `SparseIndex`
-(every 64th record → byte position), which also truncates torn trailing writes for
-free — reads seek to the nearest indexed position and scan forward.
+Each partition is a `PartitionLog`: an ordered chain of append-only `LogSegment` files
+(`data/broker-N/<topic>-<partition>/00000000000000000000.log`). Records are binary-encoded by
+`RecordSerde` (offset, timestamp, key, value), appended sequentially, **fsynced**, and never mutated.
+When the active segment exceeds `hermes.segment-bytes` (1 MiB default) it rolls to a new file named by
+its base offset. On startup segments are re-scanned to rebuild an in-memory `SparseIndex` (every 64th
+record → byte position), which also truncates torn trailing writes: reads seek to the nearest indexed
+position and scan forward.
 
-**Batching & group commit.** A batch of N records is written under one lock
-acquisition with a **single `fsync`** and replicated as **one frame**. Independently,
-`groupCommit` coalesces fsyncs across *concurrent* producers: writers append under a
-short lock, then a single flusher performs one `force()` covering all of them. A writer
-is released only once a flush that began *after* its write has completed — so durability
-is never weakened, only amortised.
+**Batching & group commit.** A batch of N records is written under one lock acquisition with a **single
+`fsync`** and replicated as **one frame**. Independently, `GroupCommitter` coalesces fsyncs across
+*concurrent* producers: writers append under a short lock and take a ticket; one waiting thread at a
+time becomes the flusher and syncs; everyone whose ticket it covers is released. A writer is released
+**only after a sync that began after its write has succeeded**. If the sync throws, nobody is released:
+waiters wake and retry the sync themselves, so an I/O error surfaces as an error to every affected
+producer instead of a false "durable" (fault-injection tested; see [Hardening log](#hardening-log)).
 
 ### Partition placement: consistent hashing (`io.hermes.core.cluster`)
 
-`ConsistentHashRing` places every broker on a 64-bit ring at 128 virtual points
-(FNV-1a hash with a murmur-style finalizer — the finalizer matters, see the class
-comment). `PartitionAssigner` maps `topic-partition` → the first N distinct
-brokers clockwise: index 0 leads, the rest replicate. Because the ring is a pure
-function of the configured membership, every broker computes identical
-assignments with zero coordination — a produce arriving at any node is either
-appended locally or forwarded straight to the leader over a socket.
+`ConsistentHashRing` places every broker on a 64-bit ring at 128 virtual points (FNV-1a with a
+murmur-style finalizer; raw FNV-1a clustered sequential partition names onto one broker).
+`PartitionAssigner` maps `topic-partition` → the first N distinct brokers clockwise: index 0 leads, the
+rest replicate. The ring is a pure function of the configured membership, so every broker computes
+identical assignments with zero coordination; a produce arriving at any node is appended locally or
+forwarded straight to the leader.
 
 ### Simplified Raft (`io.hermes.core.raft`)
 
-`RaftNode` implements terms, randomized election timeouts (1.5–3 s), majority
-voting and leader heartbeats (400 ms). The elected leader acts as the **cluster
-controller**: it owns topic metadata (piggybacked on heartbeats so followers
-converge) and hosts the consumer-group coordinator. What's simplified relative to
-full Raft: there is no replicated command log with commit indexes — data
-replication is per-partition instead (below), and metadata sync is
-last-writer-wins gossip from the leader.
+`RaftNode` implements terms, randomized election timeouts (1.5–3 s), majority voting and leader
+heartbeats (400 ms). The elected leader is the **cluster controller**: it owns topic metadata
+(piggybacked on heartbeats) and hosts the consumer-group coordinator. Simplified relative to full Raft:
+no replicated command log or commit indexes; data replication is per-partition, and metadata sync is
+last-writer-wins gossip from the leader. Election I/O happens outside the node's monitor (holding it
+across network calls deadlocked two simultaneous candidates in an early version).
 
 ### Replication (`io.hermes.core.replication`)
 
-After the partition leader appends locally, `Replicator` pushes the record
-synchronously to every alive follower in the replica set and counts acks. The
-write is durable once a **majority of the replica set** (leader included) holds
-it — the Raft quorum rule applied per partition. Followers apply records with
-leader-assigned offsets (`appendAssigned`), which makes replication retries
-idempotent. Under `acks=all`, a write that misses quorum **fails with 503** rather
-than being silently acknowledged.
+After the partition leader appends locally, `Replicator` pushes the record(s) synchronously to every
+alive follower and counts acks. The write is durable once a **majority of the replica set** (leader
+included) holds it. Followers apply records with leader-assigned offsets, so replication retries are
+idempotent. Under `acks=all` a write that misses quorum **fails with 503** rather than being silently
+acknowledged.
 
 ### Consumer groups (`io.hermes.core.group`)
 
-`GroupCoordinator` lives on the controller; other brokers forward group frames to
-it. Each `ConsumerGroup` tracks members in join order and a generation counter;
-every membership change (join, leave, 10 s session expiry) bumps the generation
-and re-runs **range assignment** — partitions split as evenly as possible, earlier
-joiners taking the extras. Clients detect a changed generation on join/heartbeat
-and pick up their new partitions. Committed offsets go through `OffsetStore`, an
-append-only WAL (fsynced per commit) replayed on startup. Offset commits are
-validated against the member's generation and ownership, so a zombie consumer that
-missed a rebalance cannot clobber another member's progress.
+`GroupCoordinator` lives on the controller; other brokers forward group frames to it. Each group tracks
+members and a generation counter; every membership change (join, leave, 10 s session expiry) bumps the
+generation and re-runs **range assignment**. Committed offsets go through `OffsetStore`, an append-only
+WAL fsynced per commit and replayed on startup. Commits are validated against the member's generation
+and ownership, so a zombie consumer that missed a rebalance cannot clobber another member's progress.
 
 ### Wire protocol (`io.hermes.core.net`)
 
-Every broker runs a `BrokerServer` (virtual-thread-per-connection, with a bounded
-connection ceiling that sheds load) speaking framed binary over
-`DataInput/OutputStream`: 1-byte opcode, string headers, optional record batch
-(`MessageCodec`). ~20 frame types cover votes, heartbeats, replication and forwarded
-client operations. `PeerClient` maintains a pool of persistent, auto-reconnecting
-sockets per peer with strict request/response semantics.
+Each broker runs a `BrokerServer` (virtual-thread-per-connection, bounded connection ceiling that sheds
+load) speaking framed binary over `DataInput/OutputStream`: 1-byte opcode, string headers, optional
+record batch (`MessageCodec`). `PeerClient` keeps a pool of persistent sockets per peer with strict
+request/response semantics and a configurable read timeout. Peer-call failures are logged (throttled to
+one line per peer per 5 s, with a suppressed-count) so a degraded peer is visible.
 
 ### Request routing
 
-Any broker can serve any client request:
-
-| Operation | Handled by | Non-owner behavior |
+| Operation | Handled by | Non-owner behaviour |
 |---|---|---|
 | produce | partition leader | forward `PRODUCE` (with the resolved partition) to the leader |
 | fetch | any replica of the partition | forward `FETCH` to leader |
-| create topic | controller | ask controller for the authoritative partition count, then materialize |
+| create topic | controller | ask controller for the authoritative partition count, then materialise |
 | join / heartbeat / commit / lag | controller | forward to controller |
 
-Two routing rules exist specifically to keep the cluster loop-free: forwarded
-produces carry the partition the first broker resolved (the receiver appends
-exactly there or errors — it never re-routes), and topic auto-creation always
-takes the partition count from the controller, so no two brokers can ever mod
-keys by different partition counts.
+Two rules keep the cluster loop-free: forwarded produces carry the partition the first broker resolved
+(the receiver appends exactly there or errors, never re-routes), and topic auto-creation always takes the
+partition count from the controller.
 
 ### Observability
 
-`BrokerMetrics` aggregates totals (LongAdders), per-second throughput (a
-60-bucket wheel averaged over the last 5 s) and produce latency percentiles (a
-2048-sample ring buffer → p50/p99). Exposed per broker at `/api/metrics`,
-topology at `/api/cluster`, group lag at `/api/lag`. The dashboard polls all
-three brokers every 2 s and merges their views (end offsets are taken as the max
-any replica reports).
+`BrokerMetrics` aggregates totals, per-second throughput and produce-latency percentiles, exposed at
+`/api/metrics`, topology at `/api/cluster`, group lag at `/api/lag`. Logging goes through Logback
+(`io.hermes` at `HERMES_LOG_LEVEL`, default `info`): startup, elections, load shedding, peer failures.
+The dashboard's server-side poller merges all brokers' views.
+
+### Dashboard
+
+Next.js. The **server** polls the brokers (`/api/poll`) and the browser only talks to its own origin, so
+the broker API key never reaches a client and brokers need not be browser-reachable. `/api/healthz` is a
+liveness probe. If brokers are down the UI shows an explicit unreachable state.
 
 ## Repository layout
 
 ```
-hermes-core/     broker engine — plain Java 21, zero runtime dependencies
+hermes-core/     broker engine: plain Java 21, zero runtime dependencies
 hermes-rest/     Spring Boot REST layer (one process per broker node)
-dashboard/       Next.js telemetry dashboard (port 3000)
-clients/python/  stdlib-only client + end-to-end demo
-benchmarks/      reproducible throughput/latency harness + results
-scripts/         start/stop a local 3-node cluster
+dashboard/       Next.js telemetry dashboard (port 3000) + node:test unit tests
+clients/python/  stdlib-only client (retry/failover) + demo + unittest tests
+benchmarks/      reproducible throughput/latency harness + results + analysis
+scripts/         start/stop a local 3-node cluster, load/chaos/saturation scripts
 ```
 
 ## Running locally
@@ -220,45 +256,16 @@ scripts/         start/stop a local 3-node cluster
 Prereqs: Java 21+, Maven 3.9+, Node 18+, Python 3.10+.
 
 ```bash
-# 1. build (runs the full test suite)
-mvn package
-
-# 2. start the 3-node cluster (REST :8081-8083, sockets :9091-9093)
-./scripts/start-cluster.sh
-
-# 3. run the demo: creates topic "orders" (6 partitions), produces 1000
-#    keyed messages, consumes them through consumer group "demo-consumers"
-python3 clients/python/demo.py
-
-# 4. dashboard
-cd dashboard && npm install && npm run dev
-# open http://localhost:3000
-
-# 5. tear down
+mvn package                        # build (runs the full test suite)
+./scripts/start-cluster.sh         # 3 brokers: REST :8081-8083, sockets :9091-9093
+python3 clients/python/demo.py     # create topic, produce 1000 keyed msgs, consume via a group
+cd dashboard && npm install && npm run dev      # http://localhost:3000
 ./scripts/stop-cluster.sh          # data survives in ./data; delete to reset
 ```
 
-Watch the failure modes live: `kill -9 $(cat .logs/broker-3.pid)` mid-demo —
-the dashboard flags the node, produces keep flowing to surviving partition
-leaders, and after ~1.6 s a new controller term appears if the controller died.
-
-### Reproducing the benchmarks
-
-```bash
-./scripts/start-cluster.sh
-python3 benchmarks/sweep.py 20000 16     # batch-size sweep, both workloads
-python3 benchmarks/bench.py --batch 1000 --concurrency 16 \
-        --out benchmarks/results/b1000.json
-```
-
-`benchmarks/OPTIMIZATION.md` documents the full before/after analysis, including the
-bugs that measurement uncovered.
-
-### Single node
-
-```bash
-java -jar hermes-rest/target/hermes-rest-1.0.0.jar   # defaults: id 1, :8081/:9091
-```
+Watch failure modes live: `kill -9 $(cat .logs/broker-3.pid)` mid-demo; the dashboard flags the node,
+produces keep flowing to surviving partition leaders, and after ~1.6 s a new controller term appears if
+the controller died.
 
 ### REST API (any broker)
 
@@ -276,120 +283,234 @@ GET  /api/lag | /api/metrics | /api/cluster
 GET  /api/health          200 once a controller is elected, 503 while electing
 ```
 
-Configuration (env vars): `HERMES_BROKER_ID`, `HERMES_REST_PORT`,
-`HERMES_MEMBERS` (`id@host:socketPort,...`), `HERMES_DATA_DIR`,
-`HERMES_REPLICATION_FACTOR` (2), `HERMES_DEFAULT_PARTITIONS` (3),
-`HERMES_SEGMENT_BYTES` (1 MiB), `HERMES_CLUSTER_SECRET` (empty = wire auth off),
-`HERMES_API_KEY` (empty = REST auth off; sent as `X-API-Key`),
-`HERMES_CORS_ORIGINS` (`*`), `HERMES_ACKS` (`all` = quorum-durable, default;
-`leader` = ack on local append only), `HERMES_GROUP_COMMIT` (`false`),
-`HERMES_LINGER_MS` (`0`), `HERMES_BATCH_MAX_RECORDS` (`10000`).
+Status codes: `400` invalid input · `401` bad/missing API key · `413` body over the size limit ·
+`502` a peer failed or timed out · `503` not durable (no quorum) or no controller yet · `500` unexpected.
 
-**Durability (`acks=all`, default):** a produce returns success only once a
-majority of the partition's replica set holds the record. If quorum cannot be
-reached (e.g. a follower is down), the REST layer returns **503** and the client
-must retry — the write is never silently accepted as durable. Set `acks=leader`
-for lower-latency, weaker guarantees.
+### Python client
 
-### Docker
-
-```bash
-docker compose up --build   # 3 brokers (REST :8081-8083) + dashboard (:3000)
+```python
+from hermes_client import HermesClient
+client = HermesClient(brokers=["http://b1:8081", "http://b2:8081"])   # fails over across brokers
+client.produce("orders", "payload", key="customer-7")
 ```
 
-Each broker container exposes `/api/health` as its Docker healthcheck; data
-lives on named volumes. Set `HERMES_CLUSTER_SECRET` in the environment to
-change the compose default.
+Transient failures (5xx, connection refused, timeouts) are retried with exponential backoff
+(`retries=3`, `backoff=0.2 s`, doubling, capped at `max_backoff=2 s`) after failing over across brokers;
+4xx is raised immediately. **Delivery is at-least-once**: a request that timed out or was refused for
+missing quorum may already be stored, so a retry can duplicate it.
 
-### Security model
+---
 
-- **Broker-to-broker**: when `HERMES_CLUSTER_SECRET` is set, every wire frame
-  must carry the shared secret (constant-time compared); unauthenticated
-  frames are rejected before dispatch.
-- **REST**: optional `HERMES_API_KEY` gates every endpoint except
-  `/api/health`. CORS origins are configurable. Input is validated at the
-  broker: topic/group names restricted to `[A-Za-z0-9._-]`, values ≤ 60 KB,
-  fetches clamped by both record count and an 8 MB byte budget, partition
-  indexes bounds-checked.
-- Not provided (front with a real gateway if exposed publicly): TLS,
-  per-client identity, rate limiting.
+## Configuration reference
+
+All broker settings are environment variables (see `hermes-rest/src/main/resources/application.yml`).
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `HERMES_BROKER_ID` | `1` | This node's id (must appear in `HERMES_MEMBERS`) |
+| `HERMES_REST_PORT` | `8081` | REST port |
+| `HERMES_MEMBERS` | `1@localhost:9091` | Full membership: `id@host:socketPort,...` |
+| `HERMES_DATA_DIR` | `./data/broker-<id>` | WAL, topic metadata, committed offsets |
+| `HERMES_REPLICATION_FACTOR` | `2` | Copies per partition (leader included) |
+| `HERMES_DEFAULT_PARTITIONS` | `3` | Partitions for auto-created topics |
+| `HERMES_SEGMENT_BYTES` | `1048576` | Segment roll size |
+| `HERMES_ACKS` | `all` | `all` = fsync + quorum before ack; `leader` = ack on local append (can lose acked data) |
+| `HERMES_GROUP_COMMIT` | `false` | Coalesce fsyncs across concurrent producers (recommended `true`) |
+| `HERMES_LINGER_MS` | `0` | Extra wait to widen a group-commit sync (`2` was benchmarked) |
+| `HERMES_BATCH_MAX_RECORDS` | `10000` | Max records per batch request |
+| `HERMES_MAX_REQUEST_BYTES` | `16777216` | Max HTTP body; larger → `413` before parsing |
+| `HERMES_PEER_TIMEOUT_MS` | `3000` | Wait for a peer's reply (forwarded produce, replication) |
+| `HERMES_CLUSTER_SECRET` | *(empty)* | Shared secret on every broker-to-broker frame (**set in production**) |
+| `HERMES_API_KEY` | *(empty)* | Required as `X-API-Key` on REST calls except `/api/health` (**set in production**) |
+| `HERMES_CORS_ORIGINS` | `*` | Allowed browser origins (**restrict in production**) |
+| `HERMES_SHUTDOWN_TIMEOUT` | `20s` | Drain time for in-flight requests on SIGTERM |
+| `HERMES_LOG_LEVEL` | `info` | Level for `io.hermes.*` |
+
+Dashboard: `HERMES_BROKERS` (comma-separated broker REST URLs, default the three localhost nodes) and
+`HERMES_API_KEY` (sent server-side). Startup logs a warning for each insecure setting left at its
+default (no API key, no cluster secret on a multi-node cluster, CORS `*`, `acks=leader`).
+
+---
+
+## Production deployment guide
+
+### Docker Compose
+
+```bash
+cp .env.example .env     # set HERMES_CLUSTER_SECRET (required) and HERMES_API_KEY
+docker compose up --build
+```
+
+Compose **refuses to start without `HERMES_CLUSTER_SECRET`** (no shipped default secret), binds all
+ports to loopback, gives each broker a 1 GB memory limit with `MaxRAMPercentage=75` and
+`ExitOnOutOfMemoryError` (an OOM exits so the orchestrator restarts a clean process), a 30 s stop grace
+period (longer than the 20 s drain), named volumes for data, and a `/api/health` container healthcheck.
+Put a TLS-terminating reverse proxy in front to expose the REST API or dashboard.
+
+> **Verification status:** the compose file's syntax and its fail-fast behaviour were validated, but the
+> **images were not built or run** in the development environment (no Docker daemon or base images
+> available). Build and smoke-test them in your pipeline before relying on them; see the checklist below.
+
+### Checklist before going live
+
+- [ ] `HERMES_CLUSTER_SECRET` and `HERMES_API_KEY` set; `HERMES_CORS_ORIGINS` restricted
+- [ ] TLS at a reverse proxy; broker socket ports (9091…) reachable **only** between brokers
+- [ ] `HERMES_ACKS=all`; `HERMES_GROUP_COMMIT=true`, `HERMES_LINGER_MS=2`
+- [ ] **A dedicated fast disk per broker.** Throughput is fsync-bound, so disk latency sets your ceiling
+- [ ] Data directory on a persistent volume with a backup/snapshot policy
+- [ ] Health probe on `/api/health`; alert on repeated `503` and on the `failed:` peer warnings
+- [ ] Clients retry with backoff and tolerate duplicates (at-least-once)
+- [ ] Rolling restarts: one broker at a time, wait for `/api/health` = 200 before the next
+- [ ] Smoke test: `docker compose up`, produce/consume, kill one broker, confirm recovery
+
+### Sizing notes (from the measurements above)
+
+- Plan around **batched writes** (hundreds to thousands of records per request, ideally keyed so a batch
+  lands in few partitions); single-message durable writes top out in the low thousands per partition
+  even with group commit.
+- Keep producer concurrency near the measured knee; past it latency climbs and throughput collapses
+  (single-message sweep above).
+- Replication factor 3 raises quorum tolerance by design (majority 2 of 3) but was **not benchmarked or
+  chaos-tested** here. A partition whose *leader* is down still rejects writes (no data-plane failover).
+
+---
+
+## Operations & troubleshooting
+
+| Symptom | Likely cause | What to do |
+|---|---|---|
+| `503 … did not reach a majority of replicas … not durable` | A follower is down, partitioned, or too slow | Check `/api/cluster` liveness and the `failed:` peer warnings; retry. The record may already exist on the leader (at-least-once) |
+| `502 Read timed out` | A peer reply took longer than `HERMES_PEER_TIMEOUT_MS` (disk saturated, long fsync queue) | Reduce concurrency or move to faster disks; raise `HERMES_PEER_TIMEOUT_MS` if latency is legitimately higher. The write may still have been applied |
+| `503 no controller elected yet` | Election in progress or no majority up | Wait ~2–3 s; if persistent, fewer than a majority of brokers are alive |
+| `401` | Missing/wrong `X-API-Key` | Send the key (dashboard: set `HERMES_API_KEY` on the *dashboard* server) |
+| `413` | Body larger than `HERMES_MAX_REQUEST_BYTES` | Send smaller batches |
+| Dashboard says "cluster unreachable" | `HERMES_BROKERS` wrong, or brokers down / key mismatch | `curl <dashboard>/api/poll` shows what the server sees per broker |
+| Container restarts in a loop | OOM (`ExitOnOutOfMemoryError`) or bad config | Check logs; raise memory; verify `HERMES_MEMBERS` contains `HERMES_BROKER_ID` |
+
+---
+
+## Security
+
+- **Broker-to-broker:** with `HERMES_CLUSTER_SECRET` set, every wire frame must carry it
+  (constant-time compare); unauthenticated frames are rejected before dispatch.
+- **REST:** optional `HERMES_API_KEY` gates everything except `/api/health`. Input is validated:
+  topic/group names `[A-Za-z0-9._-]`, values ≤ 60 KB, request bodies ≤ 16 MiB (413), fetches bounded by
+  record count and an 8 MB byte budget, partition indexes bounds-checked, error bodies never leak stack
+  traces.
+- **Dashboard:** the API key lives only in the dashboard server's environment. It was verified to appear
+  **0 times** in the page, the poll response and the client JS bundles.
+- **Not provided** (use a gateway): TLS, per-client identity, rate limiting.
+
+**Verification performed**
+
+| Check | Result |
+|---|---|
+| OWASP-style endpoint tests (no/wrong/right key, traversal and injection names, malformed JSON, oversized value) | all rejected with 401/400 as expected |
+| Protocol fuzzing, 50,000 random frames | 0 crashes / hangs |
+| Oversized request (126 MB, 96 MB heap) | before: broker died; after: rejected, broker alive |
+| Secret scan | no hardcoded secrets |
+| Dependency CVEs | Spring Boot 3.3.5 → 3.4.2: Tomcat 10.1.31 → 10.1.34 (CVE-2024-50379, CVE-2024-56337, CVE-2025-24813), logback 1.5.11 → 1.5.16 (CVE-2024-12798, CVE-2024-12801); all tests green after the bump |
+| SpotBugs (max effort, low threshold) | 19 findings, 0 critical/high; 1 real null-path bug fixed, the rest triaged (record-exposure style, locks already serialised by callers) |
+| PMD (errorprone + multithreading) | 3 minor findings |
+
+Docker image CVE scanning was **not** run (no scanner/daemon available); add `trivy` or `docker scout` to CI.
+
+---
 
 ## Testing
 
-`mvn verify` runs the full suite (**118 test methods**) and produces a JaCoCo
-coverage report. Measured coverage: **hermes-core 89% instructions / 79%
-branches, hermes-rest 95% / 82%**.
+**153 tests: 141 Java (JUnit 5), 7 dashboard (`node:test`), 5 Python (`unittest`)**, all passing.
+JaCoCo coverage: **hermes-core 89.5% instructions / 78.3% branches, hermes-rest 92.9% / 80.6%**.
 
 ```bash
-mvn verify                                       # run all tests + coverage
-open hermes-core/target/site/jacoco/index.html   # core coverage report
-open hermes-rest/target/site/jacoco/index.html   # REST coverage report
-mvn -pl hermes-rest test -Dtest=ProduceControllerTest   # run one test class
+mvn verify                                        # Java tests + JaCoCo
+open hermes-core/target/site/jacoco/index.html    # coverage report
+cd dashboard && npm test                          # dashboard unit tests (no extra dependencies)
+python3 -m unittest discover -s clients/python    # client retry/failover tests
 ```
-
-**Testing strategy** — tests are matched to what each layer is responsible for:
 
 | Layer | Approach | Examples |
 |---|---|---|
-| Storage / WAL | Unit tests on real temp files, incl. crash/torn-write recovery | `PartitionLogTest`, `RecordSerdeTest`, `OffsetStoreTest` |
-| Concurrency | Multi-threaded stress with correctness + coalescing assertions | `GroupCommitTest`, `ConnectionCapTest` |
-| Pure logic | Fast deterministic unit tests | `ConsistentHashRingTest`, `PartitionAssignerTest`, `ClusterStateTest`, `BrokerConfigTest`, `NamesTest` |
-| Protocol | Round-trip + fuzz (50k random frames) | `MessageCodecTest`, `FuzzAndAuthTest` |
-| REST controllers | `@WebMvcTest` slice tests with the engine **mocked** (`@MockitoBean`) — validation, error→status mapping, edge/large inputs, per endpoint | `*ControllerTest` |
-| Security / auth | Isolated filter unit tests | `ApiKeyFilterTest` |
-| Cluster | Full 3-broker integration (election → produce → replication → fetch → groups → lag → durability under crash) | `ClusterIntegrationTest`, `DurabilityQuorumTest`, `BatchProduceIntegrationTest`, `RestApiIntegrationTest` |
+| Storage / WAL | Real temp files, crash/torn-write recovery, batching = 1 fsync | `PartitionLogTest`, `PartitionLogBatchTest`, `RecordSerdeTest` |
+| Concurrency | Multi-threaded stress; **fault injection** for failed fsyncs | `GroupCommitTest`, `GroupCommitterTest`, `ConnectionCapTest` |
+| Pure logic | Fast deterministic unit tests | `ConsistentHashRingTest`, `PartitionAssignerTest`, `ClusterStateTest`, `BrokerConfigTest`, `LogThrottleTest` |
+| Networking | Stub peers (silent/slow), round-trip and fuzz | `PeerClientTimeoutTest`, `MessageCodecTest`, `FuzzAndAuthTest` |
+| REST controllers | `@WebMvcTest` slices with the engine mocked | `*ControllerTest` |
+| Filters / config | Isolated unit tests | `ApiKeyFilterTest`, `RequestSizeLimitFilterTest`, `InsecureSettingWarningsTest` |
+| Cluster | Real 3-broker integration: election, forwarding, replication, groups, durability | `ClusterIntegrationTest`, `DurabilityQuorumTest`, `BatchProduceIntegrationTest` |
+| Dashboard | Stub broker HTTP server incl. an API-key-protected one | `dashboard/test/poll.test.js` |
+| Client | Scripted stub server; sleeps patched | `clients/python/test_hermes_client.py` |
 
-Controller tests mock the broker so no disk, socket, or cluster is touched — they
-assert HTTP behaviour in isolation and run in milliseconds. There are **no real
-network calls** in the test suite.
+New behaviour in the hardening pass was developed test-first (red → green) where practical. Two test
+suites written alongside their code (`RequestSizeLimitFilterTest`, `poll.test.js`) were checked by
+**mutation**: the implementation was deliberately broken and the relevant tests confirmed to fail, then
+restored. No real network calls are made except to localhost stubs.
 
 ### CI
 
-GitHub Actions (`.github/workflows/ci.yml`) runs on every push/PR: builds and
-tests the broker on JDK 21, fails the build on any test failure, writes a
-coverage summary to the run, and uploads the JaCoCo reports, test reports, and
-the broker jar as artifacts. Separate jobs build the Next.js dashboard and
-compile-check the Python client.
+`.github/workflows/ci.yml` runs on every push/PR: Java build + tests + coverage summary and artifacts,
+dashboard tests + production build, Python compile + tests, and a compose validation job (which also
+asserts compose refuses to start without a cluster secret).
 
-## Design decisions & known simplifications
+---
 
-Deliberate trade-offs to keep the system understandable end to end:
+## Hardening log
 
-- **Static membership.** The cluster is defined by `HERMES_MEMBERS`; the hash
-  ring never moves, so there is no partition reassignment/data migration. Broker
-  death is handled by liveness-aware replication and Raft re-election, not by
-  re-placing partitions.
-- **No data-plane leader failover.** Partitions *led* by a crashed broker reject
-  writes until it returns (measured directly during chaos testing). Raft re-elects
-  the *controller* in ~1.6 s, but partition leadership follows the static ring.
-- **No follower catch-up.** A broker that was offline is not back-filled with the
-  writes it missed; replication is push-once. New writes become durable again as
-  soon as it rejoins.
-- **Metadata gossip instead of a replicated Raft log.** Topic creation converges
-  via leader heartbeats; group *offsets* are durable on the controller's disk,
-  but group *membership* resets if the controller changes (consumers transparently
-  rejoin). Raft `term`/`votedFor` are held in memory, not persisted.
-- **Fetches are served by any replica** with no high-watermark tracking, so a
-  reader hitting a lagging follower can briefly see fewer messages than the leader.
-- **`writeUTF` framing** caps individual values at ~60 KB; topic and group names
-  are restricted to `[A-Za-z0-9._-]`.
-- **fsync on every append** (amortised by batching and group commit). This is
-  *stronger* per-message durability than Kafka's default, and is the primary reason
-  single-message throughput is in the thousands rather than the millions.
+Issues found in a project-wide review, each with how it was verified.
+
+| # | Issue | Evidence | Fix |
+|---|---|---|---|
+| 1 | **Group commit released waiters after a *failed* fsync**: the `finally` block advanced the durable marker even when `force()` threw, silently breaking `acks=all` on any I/O error | Fault-injection tests failed against the old semantics (`ticket must not be treated as durable after a failed sync`; the retry returned without syncing) | Coordination extracted into `GroupCommitter`; durable marker advances only on success; waiters retry the sync. Performance unchanged (interleaved A/B) |
+| 2 | **One oversized request could kill a broker** (unbounded JSON body buffered in the heap) | 126 MB body vs 96 MB heap: broker **dead** | `RequestSizeLimitFilter` (413 on declared length; counting stream for chunked bodies); same request: broker **alive**, health 200 |
+| 3 | **Dashboard showed a healthy cluster as unreachable whenever the API key was on** (browser calls carried no key; putting it in the bundle would leak it) | Old poller vs key-protected broker: 0/1 reachable, broker healthy | Server-side polling route holds the key; verified absent from page and bundles |
+| 4 | Logging was `System.out/err` with no levels; `root: warn` would also have hidden new `INFO` lines | grep: 7 call sites | `System.Logger` in the dependency-free core (routed to Logback by Spring Boot), SLF4J in REST, `io.hermes` log level configurable |
+| 5 | Insecure defaults were silent | n/a | Startup warnings for no API key / no cluster secret / CORS `*` / `acks=leader`, as a tested pure function |
+| 6 | No graceful shutdown | n/a | `server.shutdown: graceful`, 20 s drain. SIGTERM verified to start graceful shutdown and exit cleanly (draining *under load* was not tested) |
+| 7 | Docker: named volume would be root-owned (non-root broker could not write the WAL); a known default cluster secret shipped; no JVM OOM policy | Found by reading the Dockerfile/compose | Data dir created and chowned in the image; secret now required; `ExitOnOutOfMemoryError`, memory limit, loopback ports. **Not built here** |
+| 8 | Python client gave up after one pass over the brokers | Tests failed red | Bounded retry with exponential backoff; 4xx never retried; documented at-least-once |
+| 9 | Peer read timeout hard-coded; peer failures invisible in logs | One cold-start run showed `502 Read timed out` at 4.3 s and others `503 not durable` with nothing logged | `HERMES_PEER_TIMEOUT_MS`; throttled `failed:` warnings carrying the cause |
+
+**Not reproduced.** In earlier cold-start overload runs ~2% of heavy batch requests failed (503 or
+502); I could not reproduce them in six cold-start runs after item 9 (0 failures at both 3,000 and
+10,000 ms), nor after a connection-burst test (400 simultaneous connects, max 83 ms), so I cannot claim a
+root cause or a fix. The failures occurred right after a Maven build finished, which points to host
+contention. They are now observable (item 9) and clients retry; if you see them in production, start with
+the `failed:` warnings.
+
+---
+
+## Known limitations
+
+Deliberate simplifications and honest gaps (also see `CERTIFICATION.md`):
+
+- **Static membership; no data-plane leader failover.** Partitions *led* by a crashed or partitioned
+  broker reject writes until it returns (measured). Raft re-elects the *controller* in ~1.6 s, but
+  partition leadership follows the static ring.
+- **No follower catch-up.** A broker that was offline is not back-filled with writes it missed.
+- **Raft is simplified:** no replicated log; `term`/`votedFor` are in memory, not persisted;
+  group membership resets if the controller changes (offsets are durable).
+- **No high-watermark.** Fetches from a lagging follower can briefly miss the newest records.
+- **At-least-once.** A request that fails after the leader stored the record (quorum miss or peer
+  timeout) may duplicate on retry. A batch spanning several partitions is **not atomic**: some
+  partitions' sub-batches can be stored while the call returns an error.
+- **Fetches hold the partition lock** while reading, so a slow large fetch can delay writes to that
+  partition (not measured).
+- **Topics are auto-created on first produce** (a typo creates a topic).
+- **Single-message durable throughput is bounded by fsync** (this is the stronger-than-Kafka-default
+  durability trade-off); `writeUTF` framing caps values at ~60 KB.
+- **No log retention/compaction:** disks fill; plan for it.
+- **Not verified here:** a 12–24 h soak (a 450 s accelerated soak was run); chaos scenarios needing
+  root (packet loss, disk-full, slow-disk injection, clock skew); Docker image builds and image CVE
+  scanning; Linux behaviour (all runs were on macOS); replication factor 3.
 
 ### Roadmap
 
-The two changes that would move this from "correct" to "highly available":
+1. Follower catch-up via pull-based replication, a prerequisite for (2).
+2. Data-plane leader failover: promote an in-sync replica when a partition leader dies.
+3. Persisted Raft state; batched replication frames; lock-free reads; log retention.
+4. A binary client protocol (expected to matter only at high batch sizes, where JSON parsing becomes
+   visible; ~0 benefit for single-message writes, which are fsync-bound).
 
-1. **Follower catch-up** via pull-based replication — lets a recovered broker
-   self-heal, and is a prerequisite for (2).
-2. **Data-plane leader failover** — promote an in-sync replica when a partition
-   leader dies, instead of rejecting writes until it returns.
-
-Then: persisted Raft state, batched replication frames, log retention/compaction,
-and a binary client protocol replacing JSON/HTTP.
-
-Each class in `hermes-core` carries one responsibility and the package
-boundaries (`storage`, `cluster`, `net`, `raft`, `replication`, `group`,
-`metrics`, `topic`, `broker`) match the architecture sections above — the code
-is meant to be read.
+Each class in `hermes-core` has one responsibility and the package boundaries (`storage`, `cluster`,
+`net`, `raft`, `replication`, `group`, `metrics`, `topic`, `broker`) match the architecture sections
+above. The code is meant to be read.

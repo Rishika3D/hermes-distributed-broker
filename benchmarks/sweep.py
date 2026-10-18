@@ -31,10 +31,13 @@ def main():
     out = {"total": total, "concurrency": concurrency,
            "spread": sweep(total, concurrency, False, "spread"),
            "keyed": sweep(total, concurrency, True, "keyed")}
-    os.makedirs("benchmarks/results", exist_ok=True)
-    with open("benchmarks/results/sweep.json", "w") as f:
+    # always next to this script, regardless of the caller's working directory
+    results_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
+    os.makedirs(results_dir, exist_ok=True)
+    path = os.path.join(results_dir, "sweep.json")
+    with open(path, "w") as f:
         json.dump(out, f, indent=2)
-    print("\nwrote benchmarks/results/sweep.json")
+    print(f"\nwrote {path}")
 
 if __name__ == "__main__":
     main()

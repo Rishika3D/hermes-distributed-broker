@@ -22,13 +22,15 @@ public record BrokerConfig(int brokerId,
                            String acks,
                            int batchMaxRecords,
                            long lingerMs,
-                           boolean groupCommit) {
+                           boolean groupCommit,
+                           int peerTimeoutMs) {
 
     /** Produce acknowledgement policy: quorum-durable vs leader-only. */
     public static final String ACKS_ALL = "all";
     public static final String ACKS_LEADER = "leader";
 
     public static final int DEFAULT_BATCH_MAX_RECORDS = 10_000;
+    public static final int DEFAULT_PEER_TIMEOUT_MS = 3_000;
 
     public BrokerConfig {
         if (clusterSecret != null && clusterSecret.isBlank()) {
@@ -46,20 +48,31 @@ public record BrokerConfig(int brokerId,
         if (lingerMs < 0) {
             lingerMs = 0;
         }
+        if (peerTimeoutMs <= 0) {
+            peerTimeoutMs = DEFAULT_PEER_TIMEOUT_MS;
+        }
+    }
+
+    /** Convenience constructor using the default peer timeout. */
+    public BrokerConfig(int brokerId, Path dataDir, List<BrokerNode> members, int replicationFactor,
+                        int defaultPartitions, long segmentBytes, String clusterSecret, String acks,
+                        int batchMaxRecords, long lingerMs, boolean groupCommit) {
+        this(brokerId, dataDir, members, replicationFactor, defaultPartitions, segmentBytes,
+                clusterSecret, acks, batchMaxRecords, lingerMs, groupCommit, DEFAULT_PEER_TIMEOUT_MS);
     }
 
     /** Backward-compatible constructor defaulting to durable {@code acks=all}. */
     public BrokerConfig(int brokerId, Path dataDir, List<BrokerNode> members, int replicationFactor,
                         int defaultPartitions, long segmentBytes, String clusterSecret) {
         this(brokerId, dataDir, members, replicationFactor, defaultPartitions, segmentBytes,
-                clusterSecret, ACKS_ALL, DEFAULT_BATCH_MAX_RECORDS, 0, false);
+                clusterSecret, ACKS_ALL, DEFAULT_BATCH_MAX_RECORDS, 0, false, DEFAULT_PEER_TIMEOUT_MS);
     }
 
     /** Backward-compatible constructor with an explicit ack policy. */
     public BrokerConfig(int brokerId, Path dataDir, List<BrokerNode> members, int replicationFactor,
                         int defaultPartitions, long segmentBytes, String clusterSecret, String acks) {
         this(brokerId, dataDir, members, replicationFactor, defaultPartitions, segmentBytes,
-                clusterSecret, acks, DEFAULT_BATCH_MAX_RECORDS, 0, false);
+                clusterSecret, acks, DEFAULT_BATCH_MAX_RECORDS, 0, false, DEFAULT_PEER_TIMEOUT_MS);
     }
 
     public boolean requireQuorum() {

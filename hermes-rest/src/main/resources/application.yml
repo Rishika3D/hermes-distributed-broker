@@ -1,9 +1,12 @@
 server:
   port: ${HERMES_REST_PORT:8081}
+  shutdown: graceful          # drain in-flight requests before the broker closes its logs
 
 spring:
   application:
     name: hermes-broker
+  lifecycle:
+    timeout-per-shutdown-phase: ${HERMES_SHUTDOWN_TIMEOUT:20s}
 
 hermes:
   broker-id: ${HERMES_BROKER_ID:1}
@@ -19,8 +22,11 @@ hermes:
   group-commit: ${HERMES_GROUP_COMMIT:false}
   linger-ms: ${HERMES_LINGER_MS:0}
   batch-max-records: ${HERMES_BATCH_MAX_RECORDS:10000}
+  peer-timeout-ms: ${HERMES_PEER_TIMEOUT_MS:3000}
+  max-request-bytes: ${HERMES_MAX_REQUEST_BYTES:16777216}
 
 logging:
   level:
     root: warn
     org.springframework.boot: info
+    io.hermes: ${HERMES_LOG_LEVEL:info}   # elections, startup, load-shedding

@@ -25,10 +25,20 @@ public class WebConfig implements WebMvcConfigurer {
     }
 
     @Bean
+    public FilterRegistrationBean<RequestSizeLimitFilter> requestSizeLimitFilter() {
+        FilterRegistrationBean<RequestSizeLimitFilter> registration =
+                new FilterRegistrationBean<>(new RequestSizeLimitFilter(properties.getMaxRequestBytes()));
+        registration.addUrlPatterns("/api/*");
+        registration.setOrder(1);
+        return registration;
+    }
+
+    @Bean
     public FilterRegistrationBean<ApiKeyFilter> apiKeyFilter() {
         FilterRegistrationBean<ApiKeyFilter> registration =
                 new FilterRegistrationBean<>(new ApiKeyFilter(properties.getApiKey()));
         registration.addUrlPatterns("/api/*");
+        registration.setOrder(2);
         return registration;
     }
 }

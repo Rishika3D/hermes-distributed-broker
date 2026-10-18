@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { pollCluster, mergeTopology } from "@/lib/api";
+import { fetchSnapshot, mergeTopology } from "@/lib/api";
 import MetricCard from "@/components/MetricCard";
 import BrokerHealth from "@/components/BrokerHealth";
 import ThroughputChart from "@/components/ThroughputChart";
@@ -31,7 +31,7 @@ export default function Dashboard() {
   useEffect(() => {
     let cancelled = false;
     async function sweep() {
-      const data = await pollCluster();
+      const data = await fetchSnapshot();
       if (cancelled) return;
       setSnapshot(data);
       setLastSweep(new Date());

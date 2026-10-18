@@ -23,6 +23,8 @@ import java.util.concurrent.TimeUnit;
  */
 public final class RaftNode implements Closeable {
 
+    private static final System.Logger LOG = System.getLogger(RaftNode.class.getName());
+
     /** Supplies metadata for outgoing heartbeats and applies metadata from the leader. */
     public interface MetadataChannel {
         String metadataToShare();
@@ -73,7 +75,7 @@ public final class RaftNode implements Closeable {
                 startElection();
             }
         } catch (Exception e) {
-            System.err.println("[raft] tick failed on broker " + cluster.localId() + ": " + e.getMessage());
+            LOG.log(System.Logger.Level.ERROR, "raft tick failed on broker " + cluster.localId(), e);
         }
     }
 
@@ -117,7 +119,7 @@ public final class RaftNode implements Closeable {
             if (won) {
                 role = RaftRole.LEADER;
                 leaderId = cluster.localId();
-                System.out.println("[raft] broker " + cluster.localId() + " elected leader for term " + term);
+                LOG.log(System.Logger.Level.INFO, "broker " + cluster.localId() + " elected leader for term " + term);
             }
         }
         if (won) {

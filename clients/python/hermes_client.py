@@ -8,6 +8,7 @@ node in the cluster. Pass several base URLs for failover.
 from __future__ import annotations
 
 import json
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -23,27 +24,43 @@ class HermesClient:
 
     brokers: list[str] = field(default_factory=lambda: ["http://localhost:8081"])
     timeout: float = 5.0
+    retries: int = 3            # extra full passes over the broker list after the first
+    backoff: float = 0.2        # delay before the first retry; doubles each pass
+    max_backoff: float = 2.0    # ceiling for the doubled delay
 
     # ------------------------------------------------------------- plumbing
 
     def _request(self, method: str, path: str, body: dict | list | None = None):
+        """Send a request, failing over across brokers and retrying transient failures.
+
+        Each pass tries every broker in order (immediate failover). If all fail with a
+        transient error (5xx, connection refused, timeout), sleep with exponential backoff
+        and try another pass, up to ``retries`` extra passes. 4xx errors are the caller's
+        fault and are raised at once.
+
+        Delivery is at-least-once: a produce that timed out after the broker stored it, or
+        was refused with 503 for missing quorum, may be stored again on retry.
+        """
         last_error: Exception | None = None
-        for base in self.brokers:
-            url = base.rstrip("/") + path
-            data = None if body is None else json.dumps(body).encode()
-            req = urllib.request.Request(url, data=data, method=method)
-            req.add_header("Content-Type", "application/json")
-            try:
-                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                    payload = resp.read()
-                    return json.loads(payload) if payload else None
-            except urllib.error.HTTPError as e:
-                detail = e.read().decode(errors="replace")
-                last_error = HermesError(f"{method} {url} -> {e.code}: {detail}")
-                if 400 <= e.code < 500:
-                    raise last_error from None  # our fault; retrying won't help
-            except OSError as e:  # connection refused, timeout, DNS...
-                last_error = e
+        for attempt in range(self.retries + 1):
+            for base in self.brokers:
+                url = base.rstrip("/") + path
+                data = None if body is None else json.dumps(body).encode()
+                req = urllib.request.Request(url, data=data, method=method)
+                req.add_header("Content-Type", "application/json")
+                try:
+                    with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                        payload = resp.read()
+                        return json.loads(payload) if payload else None
+                except urllib.error.HTTPError as e:
+                    detail = e.read().decode(errors="replace")
+                    last_error = HermesError(f"{method} {url} -> {e.code}: {detail}")
+                    if 400 <= e.code < 500:
+                        raise last_error from None  # our fault; retrying won't help
+                except OSError as e:  # connection refused, timeout, DNS...
+                    last_error = e
+            if attempt < self.retries:
+                time.sleep(min(self.backoff * 2 ** attempt, self.max_backoff))
         raise HermesError(f"no broker reachable for {method} {path}") from last_error
 
     # --------------------------------------------------------------- admin

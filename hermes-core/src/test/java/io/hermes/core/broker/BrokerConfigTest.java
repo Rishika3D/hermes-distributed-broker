@@ -60,6 +60,17 @@ class BrokerConfigTest {
     }
 
     @Test
+    void peerTimeoutDefaultsToThreeSecondsAndHonoursAnExplicitValue() {
+        assertEquals(3_000, new BrokerConfig(1, Path.of("/tmp/x"), MEMBERS, 2, 3, 1024,
+                null, "all", 0, 0, false, 0).peerTimeoutMs(), "0 -> default");
+        assertEquals(3_000, new BrokerConfig(1, Path.of("/tmp/x"), MEMBERS, 2, 3, 1024,
+                null, "all", 0, 0, false, -1).peerTimeoutMs(), "negative -> default");
+        assertEquals(10_000, new BrokerConfig(1, Path.of("/tmp/x"), MEMBERS, 2, 3, 1024,
+                null, "all", 0, 0, false, 10_000).peerTimeoutMs());
+        assertEquals(3_000, config("all").peerTimeoutMs(), "convenience constructors keep the default");
+    }
+
+    @Test
     void localNodeMustBePresentInMembers() {
         BrokerConfig missing = new BrokerConfig(99, Path.of("/tmp/x"), MEMBERS, 2, 3, 1024, null);
         assertThrows(IllegalArgumentException.class, missing::localNode);

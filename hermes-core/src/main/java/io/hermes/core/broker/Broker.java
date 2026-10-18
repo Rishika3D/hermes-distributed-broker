@@ -47,6 +47,8 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 public class Broker implements Closeable, RaftNode.MetadataChannel {
 
+    private static final System.Logger LOG = System.getLogger(Broker.class.getName());
+
     /** writeUTF frames cap at 65,535 encoded bytes; leave headroom for headers. */
     public static final int MAX_VALUE_BYTES = 60_000;
     public static final int MAX_KEY_BYTES = 10_000;
@@ -76,7 +78,7 @@ public class Broker implements Closeable, RaftNode.MetadataChannel {
         this.assigner = new PartitionAssigner(new ConsistentHashRing(memberIds), config.replicationFactor());
         this.registry = new TopicRegistry(config.dataDir(), config.segmentBytes(),
                 config.groupCommit(), config.lingerMs(), assigner, config.brokerId());
-        this.peers = new PeerChannels(cluster, config.clusterSecret());
+        this.peers = new PeerChannels(cluster, config.clusterSecret(), config.peerTimeoutMs());
         this.raft = new RaftNode(cluster, peers, this);
         this.replicator = new Replicator(cluster, peers, metrics);
         this.coordinator = new GroupCoordinator(new OffsetStore(config.dataDir().resolve("offsets.log")));
@@ -87,8 +89,9 @@ public class Broker implements Closeable, RaftNode.MetadataChannel {
     public void start() throws IOException {
         server.start();
         raft.start();
-        System.out.println("[hermes] broker " + config.brokerId() + " listening on socket port "
-                + cluster.localNode().port());
+        LOG.log(System.Logger.Level.INFO, "broker " + config.brokerId() + " listening on socket port "
+                + cluster.localNode().port() + " (acks=" + config.acks()
+                + ", groupCommit=" + config.groupCommit() + ")");
     }
 
     // ------------------------------------------------------------------ topics

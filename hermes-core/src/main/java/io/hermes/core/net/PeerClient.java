@@ -25,15 +25,22 @@ import java.util.Deque;
 public final class PeerClient implements Closeable {
 
     private static final int CONNECT_TIMEOUT_MS = 1_000;
-    private static final int READ_TIMEOUT_MS = 3_000;
+    public static final int DEFAULT_READ_TIMEOUT_MS = 3_000;
     private static final int MAX_IDLE_CONNECTIONS = 4;
 
     private final BrokerNode node;
+    private final int readTimeoutMs;
     private final Deque<Connection> idle = new ArrayDeque<>();
     private volatile boolean closed;
 
     public PeerClient(BrokerNode node) {
+        this(node, DEFAULT_READ_TIMEOUT_MS);
+    }
+
+    /** @param readTimeoutMs how long to wait for a peer's reply before failing the request */
+    public PeerClient(BrokerNode node, int readTimeoutMs) {
         this.node = node;
+        this.readTimeoutMs = readTimeoutMs;
     }
 
     public WireMessage request(WireMessage message) throws IOException {
@@ -55,7 +62,7 @@ public final class PeerClient implements Closeable {
                 return pooled;
             }
         }
-        return Connection.open(node);
+        return Connection.open(node, readTimeoutMs);
     }
 
     private void giveBack(Connection connection) {
@@ -94,10 +101,10 @@ public final class PeerClient implements Closeable {
             this.out = out;
         }
 
-        static Connection open(BrokerNode node) throws IOException {
+        static Connection open(BrokerNode node, int readTimeoutMs) throws IOException {
             Socket socket = new Socket();
             socket.connect(new InetSocketAddress(node.host(), node.port()), CONNECT_TIMEOUT_MS);
-            socket.setSoTimeout(READ_TIMEOUT_MS);
+            socket.setSoTimeout(readTimeoutMs);
             socket.setTcpNoDelay(true);
             return new Connection(socket,
                     new DataInputStream(new BufferedInputStream(socket.getInputStream())),

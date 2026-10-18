@@ -8,6 +8,7 @@ import java.io.IOException;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * The pool of peer connections, one {@link PeerClient} per remote broker.
@@ -19,13 +20,22 @@ public final class PeerChannels implements Closeable {
     /** Header carrying the shared cluster secret on every authenticated frame. */
     public static final String SECRET_HEADER = "_secret";
 
+    private static final System.Logger LOG = System.getLogger(PeerChannels.class.getName());
+    private static final long FAILURE_LOG_INTERVAL_MS = 5_000;
+
     private final Map<Integer, PeerClient> clients = new LinkedHashMap<>();
+    private final Map<Integer, LogThrottle> failureLogs = new ConcurrentHashMap<>();
     private final String clusterSecret;
 
     public PeerChannels(ClusterState cluster, String clusterSecret) {
+        this(cluster, clusterSecret, PeerClient.DEFAULT_READ_TIMEOUT_MS);
+    }
+
+    public PeerChannels(ClusterState cluster, String clusterSecret, int readTimeoutMs) {
         this.clusterSecret = clusterSecret;
         for (BrokerNode peer : cluster.peers()) {
-            clients.put(peer.id(), new PeerClient(peer));
+            clients.put(peer.id(), new PeerClient(peer, readTimeoutMs));
+            failureLogs.put(peer.id(), new LogThrottle(FAILURE_LOG_INTERVAL_MS));
         }
     }
 
@@ -48,8 +58,20 @@ public final class PeerChannels implements Closeable {
     public Optional<WireMessage> tryRequest(int brokerId, WireMessage message) {
         try {
             return Optional.of(request(brokerId, message));
-        } catch (IOException unreachable) {
+        } catch (IOException failure) {
+            logFailure(brokerId, message, failure);
             return Optional.empty();
+        }
+    }
+
+    /** One WARN per peer per interval, carrying the cause and how many similar failures it hides. */
+    private void logFailure(int brokerId, WireMessage message, IOException failure) {
+        LogThrottle throttle = failureLogs.get(brokerId);
+        if (throttle != null && throttle.allow(System.currentTimeMillis())) {
+            int hidden = throttle.takeSuppressed();
+            LOG.log(System.Logger.Level.WARNING, "request " + message.type() + " to broker " + brokerId
+                    + " failed: " + failure.getMessage()
+                    + (hidden > 0 ? " (+" + hidden + " similar suppressed)" : ""));
         }
     }
 

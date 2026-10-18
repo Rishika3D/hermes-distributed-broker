@@ -22,6 +22,8 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 public final class BrokerServer implements Closeable {
 
+    private static final System.Logger LOG = System.getLogger(BrokerServer.class.getName());
+
     /** Default ceiling on concurrent connections — sheds load beyond this. */
     public static final int DEFAULT_MAX_CONNECTIONS = 4_096;
     /** Idle read timeout; a peer that sends nothing for this long is dropped. */
@@ -61,7 +63,7 @@ public final class BrokerServer implements Closeable {
                 // Shed load rather than spawn unbounded work: if we are at the
                 // connection ceiling, close the new socket immediately.
                 if (!connectionPermits.tryAcquire()) {
-                    System.err.println("[hermes] connection limit " + maxConnections
+                    LOG.log(System.Logger.Level.WARNING, "connection limit " + maxConnections
                             + " reached on port " + port + "; rejecting connection");
                     closeQuietly(socket);
                     continue;
@@ -72,7 +74,7 @@ public final class BrokerServer implements Closeable {
                 return;
             } catch (IOException e) {
                 if (running) {
-                    System.err.println("[hermes] accept failed on port " + port + ": " + e.getMessage());
+                    LOG.log(System.Logger.Level.ERROR, "accept failed on port " + port, e);
                 }
             }
         }
@@ -98,7 +100,7 @@ public final class BrokerServer implements Closeable {
             // peer closed the connection; normal shutdown path
         } catch (IOException e) {
             if (running) {
-                System.err.println("[hermes] connection error on port " + port + ": " + e.getMessage());
+                LOG.log(System.Logger.Level.WARNING, "connection error on port " + port + ": " + e.getMessage());
             }
         } finally {
             activeConnections.decrementAndGet();

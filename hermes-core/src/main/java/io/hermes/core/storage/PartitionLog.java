@@ -10,8 +10,6 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
-import java.util.concurrent.locks.Condition;
-import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Stream;
 
 /**
@@ -24,23 +22,26 @@ public final class PartitionLog implements Closeable {
 
     private final Path dir;
     private final long maxSegmentBytes;
-    private final boolean groupCommit;
-    private final long lingerMs;
     private final List<LogSegment> segments = new ArrayList<>();
-
-    // Group-commit coordination. writeSeq counts completed channel writes (assigned
-    // under the write monitor); flushedSeq is the highest writeSeq made durable.
-    private final ReentrantLock flushLock = new ReentrantLock();
-    private final Condition flushed = flushLock.newCondition();
-    private long writeSeq;
-    private long flushedSeq;
-    private boolean flushing;
+    /** Non-null when group commit is enabled: coalesces fsyncs across concurrent appenders. */
+    private final GroupCommitter committer;
 
     private PartitionLog(Path dir, long maxSegmentBytes, boolean groupCommit, long lingerMs) {
         this.dir = dir;
         this.maxSegmentBytes = maxSegmentBytes;
-        this.groupCommit = groupCommit;
-        this.lingerMs = lingerMs;
+        this.committer = groupCommit ? new GroupCommitter(this::syncActiveSegment, lingerMs) : null;
+    }
+
+    /**
+     * Forces the active segment. Earlier segments were already fsynced when the log rolled
+     * (see {@link #writeAssigned}), so forcing the active one covers every outstanding write.
+     */
+    private void syncActiveSegment() throws IOException {
+        LogSegment active;
+        synchronized (this) {
+            active = activeSegment();
+        }
+        active.flush();
     }
 
     public static PartitionLog open(Path dir, long maxSegmentBytes) throws IOException {
@@ -74,14 +75,13 @@ public final class PartitionLog implements Closeable {
     }
 
     /**
-     * Appends a single record with a leader-assigned offset. With group commit
-     * disabled this is a serial write + fsync under the monitor. With it
-     * enabled, the write happens under the monitor but the fsync is coalesced
-     * across concurrent appenders via {@link #groupFlush}, so N concurrent
-     * single appends to this partition share far fewer than N fsyncs.
+     * Appends a single record with a leader-assigned offset and returns only once it is
+     * durable. With group commit off this is a serial write + fsync under the monitor; with
+     * it on, the write is still serialized but the fsync is shared with concurrent appenders
+     * (see {@link GroupCommitter}), so N concurrent appends cost far fewer than N fsyncs.
      */
     public Message append(String key, String value, long timestamp) throws IOException {
-        if (!groupCommit) {
+        if (committer == null) {
             synchronized (this) {
                 Message message = new Message(endOffset(), timestamp, key, value);
                 appendAssigned(message);
@@ -89,66 +89,14 @@ public final class PartitionLog implements Closeable {
             }
         }
         Message message;
-        long mySeq;
+        long ticket;
         synchronized (this) {
             message = new Message(endOffset(), timestamp, key, value);
-            writeAssigned(message);      // write bytes to the channel, no fsync (may roll + flush old seg)
-            mySeq = ++writeSeq;
+            writeAssigned(message);       // bytes into the channel; durable only after the shared sync
+            ticket = committer.ticket();  // issued under the monitor => ticket order == write order
         }
-        groupFlush(mySeq);
+        committer.awaitDurable(ticket);
         return message;
-    }
-
-    /**
-     * Coalesced fsync. A thread returns only once a {@code force()} that began
-     * after its write completed has finished, so its bytes are durable.
-     *
-     * <p>Correctness: {@code force()} makes durable every byte written to the
-     * channel before it was called. The flusher captures {@code target =
-     * writeSeq} (>= the caller's seq) under the monitor, then forces the active
-     * segment; because writes are serialized and assign their seq only after
-     * writing their bytes, all writes with seq <= target are already in the
-     * channel, so the force covers them. It then sets {@code flushedSeq =
-     * target}. A waiter with seq S is released only when {@code flushedSeq >=
-     * S} — i.e. by a force that started strictly after its write. Over-covering
-     * (bytes with seq > target that raced in before the force) is harmless.
-     */
-    private void groupFlush(long mySeq) throws IOException {
-        flushLock.lock();
-        try {
-            while (flushedSeq < mySeq) {
-                if (flushing) {
-                    flushed.awaitUninterruptibly();
-                    continue;
-                }
-                flushing = true;
-                flushLock.unlock();
-                long target = 0;
-                try {
-                    if (lingerMs > 0) {
-                        Thread.sleep(lingerMs);      // let more writers accumulate before forcing
-                    }
-                    // Capture target AFTER the linger, immediately before the force, so every
-                    // write that landed during the window is covered by this one fsync.
-                    LogSegment segment;
-                    synchronized (this) {
-                        target = writeSeq;
-                        segment = activeSegment();
-                    }
-                    segment.flush();                 // the shared fsync, held under no lock
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    throw new IOException("group flush interrupted", e);
-                } finally {
-                    flushLock.lock();
-                    flushedSeq = Math.max(flushedSeq, target);
-                    flushing = false;
-                    flushed.signalAll();
-                }
-            }
-        } finally {
-            flushLock.unlock();
-        }
     }
 
     /**
@@ -159,22 +107,20 @@ public final class PartitionLog implements Closeable {
      */
     public List<Message> appendBatch(List<ProduceRecord> records, long timestamp) throws IOException {
         List<Message> stored = new ArrayList<>(records.size());
-        long mySeq;
+        long ticket;
         synchronized (this) {
             for (ProduceRecord record : records) {
                 Message message = new Message(endOffset(), timestamp, record.key(), record.value());
                 writeAssigned(message);
                 stored.add(message);
             }
-            if (!groupCommit) {
-                activeSegment().flush();      // one fsync for this batch, serial mode
+            if (committer == null) {
+                activeSegment().flush();      // one fsync for the whole batch
                 return stored;
             }
-            mySeq = ++writeSeq;               // whole batch shares one write-sequence slot
+            ticket = committer.ticket();      // the whole batch shares one ticket
         }
-        // Group-commit mode: concurrent batches (including single-record produces from
-        // the leader path) coalesce their fsyncs via the shared flusher.
-        groupFlush(mySeq);
+        committer.awaitDurable(ticket);       // concurrent batches/singles share one sync
         return stored;
     }
 

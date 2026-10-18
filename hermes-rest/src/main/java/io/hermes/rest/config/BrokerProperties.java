@@ -45,6 +45,12 @@ public class BrokerProperties {
     /** Max records accepted in one batch produce request. */
     private int batchMaxRecords = 10000;
 
+    /** How long a broker waits for a peer's reply (forwarded produce, replication) before failing it. */
+    private int peerTimeoutMs = 3000;
+
+    /** Max HTTP request body in bytes; larger bodies are rejected with 413 before parsing. */
+    private long maxRequestBytes = 16L * 1024 * 1024;
+
     public int getBrokerId() {
         return brokerId;
     }
@@ -147,5 +153,21 @@ public class BrokerProperties {
 
     public void setBatchMaxRecords(int batchMaxRecords) {
         this.batchMaxRecords = batchMaxRecords;
+    }
+
+    public long getMaxRequestBytes() {
+        return maxRequestBytes;
+    }
+
+    public void setMaxRequestBytes(long maxRequestBytes) {
+        this.maxRequestBytes = maxRequestBytes;
+    }
+
+    public int getPeerTimeoutMs() {
+        return peerTimeoutMs;
+    }
+
+    public void setPeerTimeoutMs(int peerTimeoutMs) {
+        this.peerTimeoutMs = peerTimeoutMs;
     }
 }

@@ -1,15 +1,29 @@
-# Local 3-node Hermes cluster + dashboard.
+# 3-node Hermes cluster + dashboard.
+#
+#   cp .env.example .env      # set HERMES_CLUSTER_SECRET (required) and HERMES_API_KEY
 #   docker compose up --build
-# REST APIs on localhost:8081-8083, dashboard on localhost:3000.
-# NEXT_PUBLIC_BROKERS points at the host-mapped ports because the browser
-# (not the dashboard container) makes the API calls.
+#
+# REST APIs:  http://localhost:8081-8083      Dashboard: http://localhost:3000
+# Ports are bound to loopback; put a TLS-terminating reverse proxy in front to expose them.
+# The dashboard polls the brokers server-side over the compose network, so the brokers
+# never need to be reachable from a browser and the API key never reaches one.
 
 x-broker: &broker
   build: .
   restart: unless-stopped
+  stop_grace_period: 30s          # > HERMES_SHUTDOWN_TIMEOUT (20s) so in-flight writes drain
+  deploy:
+    resources:
+      limits:
+        memory: 1g                # JVM heap = 75% of this (MaxRAMPercentage in the Dockerfile)
   environment: &broker-env
     HERMES_MEMBERS: 1@broker-1:9091,2@broker-2:9091,3@broker-3:9091
-    HERMES_CLUSTER_SECRET: ${HERMES_CLUSTER_SECRET:-change-me-in-prod}
+    HERMES_CLUSTER_SECRET: ${HERMES_CLUSTER_SECRET:?set HERMES_CLUSTER_SECRET in .env (shared secret for broker-to-broker traffic)}
+    HERMES_API_KEY: ${HERMES_API_KEY:-}
+    HERMES_CORS_ORIGINS: ${HERMES_CORS_ORIGINS:-http://localhost:3000}
+    HERMES_ACKS: ${HERMES_ACKS:-all}
+    HERMES_GROUP_COMMIT: ${HERMES_GROUP_COMMIT:-true}
+    HERMES_LINGER_MS: ${HERMES_LINGER_MS:-2}
 
 services:
   broker-1:
@@ -17,7 +31,7 @@ services:
     environment:
       <<: *broker-env
       HERMES_BROKER_ID: "1"
-    ports: ["8081:8081"]
+    ports: ["127.0.0.1:8081:8081"]
     volumes: ["hermes-data-1:/opt/hermes/data"]
 
   broker-2:
@@ -25,7 +39,7 @@ services:
     environment:
       <<: *broker-env
       HERMES_BROKER_ID: "2"
-    ports: ["8082:8081"]
+    ports: ["127.0.0.1:8082:8081"]
     volumes: ["hermes-data-2:/opt/hermes/data"]
 
   broker-3:
@@ -33,16 +47,16 @@ services:
     environment:
       <<: *broker-env
       HERMES_BROKER_ID: "3"
-    ports: ["8083:8081"]
+    ports: ["127.0.0.1:8083:8081"]
     volumes: ["hermes-data-3:/opt/hermes/data"]
 
   dashboard:
-    build:
-      context: dashboard
-      args:
-        NEXT_PUBLIC_BROKERS: http://localhost:8081,http://localhost:8082,http://localhost:8083
-    ports: ["3000:3000"]
-    depends_on: [broker-1, broker-2, broker-3]
+    build: dashboard
+    restart: unless-stopped
+    environment:
+      HERMES_BROKERS: http://broker-1:8081,http://broker-2:8081,http://broker-3:8081
+      HERMES_API_KEY: ${HERMES_API_KEY:-}
+    ports: ["127.0.0.1:3000:3000"]
 
 volumes:
   hermes-data-1:

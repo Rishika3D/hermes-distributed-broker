@@ -1,5 +1,7 @@
 package io.hermes.rest.api;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
@@ -12,6 +14,8 @@ import java.util.Map;
 /** Maps engine exceptions onto HTTP status codes with a uniform error body. */
 @RestControllerAdvice
 public class ApiExceptionHandler {
+
+    private static final Logger LOG = LoggerFactory.getLogger(ApiExceptionHandler.class);
 
     @ExceptionHandler(IllegalArgumentException.class)
     public ResponseEntity<Map<String, String>> badRequest(IllegalArgumentException e) {
@@ -44,7 +48,7 @@ public class ApiExceptionHandler {
     /** Catch-all: never leak stack traces or internal class names to clients. */
     @ExceptionHandler(Exception.class)
     public ResponseEntity<Map<String, String>> unexpected(Exception e) {
-        System.err.println("[hermes-rest] unhandled " + e.getClass().getName() + ": " + e.getMessage());
+        LOG.error("unhandled exception serving request", e);
         return error(HttpStatus.INTERNAL_SERVER_ERROR, "internal error");
     }
 

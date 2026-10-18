@@ -1,53 +1,20 @@
-const DEFAULT_BROKERS = [
-  "http://localhost:8081",
-  "http://localhost:8082",
-  "http://localhost:8083",
-];
-
-export function brokerUrls() {
-  const configured = process.env.NEXT_PUBLIC_BROKERS;
-  const urls = configured ? configured.split(",") : DEFAULT_BROKERS;
-  return urls.map((u) => u.trim()).filter(Boolean);
-}
-
-async function getJson(url, timeoutMs = 1500) {
+/**
+ * Fetches the latest cluster snapshot from this app's own server-side poller (/api/poll).
+ * Never throws: if even the dashboard server is unreachable, returns an empty snapshot so
+ * the UI shows its "cluster unreachable" state instead of crashing.
+ */
+export async function fetchSnapshot(timeoutMs = 6000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetch(url, { signal: controller.signal, cache: "no-store" });
-    if (!res.ok) return null;
+    const res = await fetch("/api/poll", { signal: controller.signal, cache: "no-store" });
+    if (!res.ok) throw new Error(`poll responded ${res.status}`);
     return await res.json();
   } catch {
-    return null;
+    return { brokers: [], lag: [] };
   } finally {
     clearTimeout(timer);
   }
-}
-
-/**
- * One polling sweep across every configured broker: per-broker metrics and
- * cluster view, plus a lag report from the first broker that can serve one.
- */
-export async function pollCluster() {
-  const urls = brokerUrls();
-  const brokers = await Promise.all(
-    urls.map(async (url) => {
-      const [metrics, cluster] = await Promise.all([
-        getJson(`${url}/api/metrics`),
-        getJson(`${url}/api/cluster`),
-      ]);
-      return { url, metrics, cluster };
-    })
-  );
-
-  let lag = null;
-  for (const broker of brokers) {
-    if (!broker.metrics) continue;
-    lag = await getJson(`${broker.url}/api/lag`, 2500);
-    if (lag) break;
-  }
-
-  return { brokers, lag: lag ?? [] };
 }
 
 /**
