@@ -10,6 +10,7 @@ import java.io.IOException;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketException;
+import java.net.SocketTimeoutException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
@@ -98,6 +99,9 @@ public final class BrokerServer implements Closeable {
             }
         } catch (EOFException | SocketException disconnected) {
             // peer closed the connection; normal shutdown path
+        } catch (SocketTimeoutException idle) {
+            // a pooled peer connection sat unused past READ_TIMEOUT_MS: routine, not an error
+            LOG.log(System.Logger.Level.DEBUG, "closed idle connection on port " + port);
         } catch (IOException e) {
             if (running) {
                 LOG.log(System.Logger.Level.WARNING, "connection error on port " + port + ": " + e.getMessage());

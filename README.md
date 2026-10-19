@@ -3,8 +3,8 @@
 [![CI](https://github.com/Rishika3D/hermes-distributed-broker/actions/workflows/ci.yml/badge.svg)](https://github.com/Rishika3D/hermes-distributed-broker/actions/workflows/ci.yml)
 ![Java](https://img.shields.io/badge/Java-21-orange)
 ![Spring Boot](https://img.shields.io/badge/Spring%20Boot-3.4-green)
-![Tests](https://img.shields.io/badge/tests-153%20passing-brightgreen)
-![Coverage](https://img.shields.io/badge/coverage-core%2089.5%25%20%7C%20rest%2092.9%25-brightgreen)
+![Tests](https://img.shields.io/badge/tests-162%20passing-brightgreen)
+![Coverage](https://img.shields.io/badge/coverage-core%2089.4%25%20%7C%20rest%2092.9%25-brightgreen)
 
 A distributed message broker built from first principles in Java: topics, partitions, append-only
 write-ahead-log segments, consistent-hash partition placement, simplified Raft leader election,
@@ -347,9 +347,12 @@ ports to loopback, gives each broker a 1 GB memory limit with `MaxRAMPercentage=
 period (longer than the 20 s drain), named volumes for data, and a `/api/health` container healthcheck.
 Put a TLS-terminating reverse proxy in front to expose the REST API or dashboard.
 
-> **Verification status:** the compose file's syntax and its fail-fast behaviour were validated, but the
-> **images were not built or run** in the development environment (no Docker daemon or base images
-> available). Build and smoke-test them in your pipeline before relying on them; see the checklist below.
+> **Verification status:** this exact compose stack was built and run on Docker Desktop (macOS) and
+> smoke-tested: 4 containers healthy; auth enforced (401/200); produce on broker 1 read back from broker 3;
+> a 1,000-record batch (0.27 s); a hard-killed broker (writes to partitions needing it refused, the rest
+> kept working) and its recovery (20/20 writes after restart); a full `down`/`up` with **data and topics
+> preserved on the named volumes**; non-root `hermes` user owning its volume; `docker stop` drained and
+> exited in ~1 s. It was **not** tested on Linux, under sustained load in containers, or with image CVE scanning.
 
 ### Checklist before going live
 
@@ -382,6 +385,7 @@ Put a TLS-terminating reverse proxy in front to expose the REST API or dashboard
 | `503 … did not reach a majority of replicas … not durable` | A follower is down, partitioned, or too slow | Check `/api/cluster` liveness and the `failed:` peer warnings; retry. The record may already exist on the leader (at-least-once) |
 | `502 Read timed out` | A peer reply took longer than `HERMES_PEER_TIMEOUT_MS` (disk saturated, long fsync queue) | Reduce concurrency or move to faster disks; raise `HERMES_PEER_TIMEOUT_MS` if latency is legitimately higher. The write may still have been applied |
 | `503 no controller elected yet` | Election in progress or no majority up | Wait ~2–3 s; if persistent, fewer than a majority of brokers are alive |
+| First write(s) after an idle period fail, then succeed | (fixed in this release) stale pooled peer connections | Upgrade; see hardening log #10 |
 | `401` | Missing/wrong `X-API-Key` | Send the key (dashboard: set `HERMES_API_KEY` on the *dashboard* server) |
 | `413` | Body larger than `HERMES_MAX_REQUEST_BYTES` | Send smaller batches |
 | Dashboard says "cluster unreachable" | `HERMES_BROKERS` wrong, or brokers down / key mismatch | `curl <dashboard>/api/poll` shows what the server sees per broker |
@@ -419,8 +423,8 @@ Docker image CVE scanning was **not** run (no scanner/daemon available); add `tr
 
 ## Testing
 
-**153 tests: 141 Java (JUnit 5), 7 dashboard (`node:test`), 5 Python (`unittest`)**, all passing.
-JaCoCo coverage: **hermes-core 89.5% instructions / 78.3% branches, hermes-rest 92.9% / 80.6%**.
+**162 tests: 150 Java (JUnit 5), 7 dashboard (`node:test`), 5 Python (`unittest`)**, all passing.
+JaCoCo coverage: **hermes-core 89.4% instructions / 78.6% branches, hermes-rest 92.9% / 79.5%**.
 
 ```bash
 mvn verify                                        # Java tests + JaCoCo
@@ -456,7 +460,7 @@ asserts compose refuses to start without a cluster secret).
 
 ## Hardening log
 
-Issues found in a project-wide review, each with how it was verified.
+Issues found in a project-wide review and while deploying, each with how it was verified.
 
 | # | Issue | Evidence | Fix |
 |---|---|---|---|
@@ -470,12 +474,17 @@ Issues found in a project-wide review, each with how it was verified.
 | 8 | Python client gave up after one pass over the brokers | Tests failed red | Bounded retry with exponential backoff; 4xx never retried; documented at-least-once |
 | 9 | Peer read timeout hard-coded; peer failures invisible in logs | One cold-start run showed `502 Read timed out` at 4.3 s and others `503 not durable` with nothing logged | `HERMES_PEER_TIMEOUT_MS`; throttled `failed:` warnings carrying the cause |
 
+| 10 | **Writes failed after the cluster sat idle**: the server closes peer sockets idle > 60 s, but the client pool reused the dead sockets, so the first request on each failed (found only by deploying: `200 502 502 200 …`) | Reproduced on the Docker stack; unit tests failed when eviction/purge were disabled (mutation check) | Pool evicts connections idle > 30 s and discards the rest of the pool when a reused connection fails. After the fix: 14/14 writes OK after a 75 s idle |
+| 11 | Peer failures logged as `failed: null` (an `EOFException` has no message); routine idle closes logged as WARN | Seen in the deployed logs | Failures always name the exception class; idle closes are DEBUG |
+| 12 | **Client mistakes returned 500 + an ERROR stack trace** (unknown route, wrong method, non-numeric path variable, missing parameter), so a typo'd URL would page an operator | 4/4 new tests failed (red) | Handler extends Spring's `ResponseEntityExceptionHandler`: 404 / 405 / 400 with the same `{"error": …}` body |
+
 **Not reproduced.** In earlier cold-start overload runs ~2% of heavy batch requests failed (503 or
 502); I could not reproduce them in six cold-start runs after item 9 (0 failures at both 3,000 and
 10,000 ms), nor after a connection-burst test (400 simultaneous connects, max 83 ms), so I cannot claim a
 root cause or a fix. The failures occurred right after a Maven build finished, which points to host
 contention. They are now observable (item 9) and clients retry; if you see them in production, start with
-the `failed:` warnings.
+the `failed:` warnings. (Item 10 is a *different* bug, found afterwards, and is not a confirmed
+explanation for these: those runs had no idle period.)
 
 ---
 
@@ -500,8 +509,8 @@ Deliberate simplifications and honest gaps (also see `CERTIFICATION.md`):
   durability trade-off); `writeUTF` framing caps values at ~60 KB.
 - **No log retention/compaction:** disks fill; plan for it.
 - **Not verified here:** a 12–24 h soak (a 450 s accelerated soak was run); chaos scenarios needing
-  root (packet loss, disk-full, slow-disk injection, clock skew); Docker image builds and image CVE
-  scanning; Linux behaviour (all runs were on macOS); replication factor 3.
+  root (packet loss, disk-full, slow-disk injection, clock skew); image CVE scanning; Linux behaviour
+  (all runs were on macOS, including Docker Desktop); load testing inside containers; replication factor 3.
 
 ### Roadmap
 

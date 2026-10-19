@@ -21,15 +21,26 @@ import java.util.Deque;
  * cross-broker wait cycles that stall the cluster until timeouts fire.
  * A connection carries exactly one outstanding request at a time; failed
  * connections are discarded, healthy ones return to the pool.
+ *
+ * <p>Pooled connections go stale: the server closes sockets that sit idle
+ * (BrokerServer: 60 s) and a restarted peer drops them all. Handing a dead socket
+ * to a request fails that request, so (1) connections idle longer than
+ * {@code idleEvictMs} (default 30 s, below the server's timeout) are discarded
+ * instead of reused, and (2) when a <em>reused</em> connection fails, the rest of
+ * the pool is discarded too, since it is almost certainly dead for the same reason.
+ * Failed requests are not replayed: the peer may already have processed them.
  */
 public final class PeerClient implements Closeable {
 
     private static final int CONNECT_TIMEOUT_MS = 1_000;
     public static final int DEFAULT_READ_TIMEOUT_MS = 3_000;
+    /** Must stay below BrokerServer's idle read timeout so we never reuse a socket it has closed. */
+    public static final long DEFAULT_IDLE_EVICT_MS = 30_000;
     private static final int MAX_IDLE_CONNECTIONS = 4;
 
     private final BrokerNode node;
     private final int readTimeoutMs;
+    private final long idleEvictMs;
     private final Deque<Connection> idle = new ArrayDeque<>();
     private volatile boolean closed;
 
@@ -39,8 +50,14 @@ public final class PeerClient implements Closeable {
 
     /** @param readTimeoutMs how long to wait for a peer's reply before failing the request */
     public PeerClient(BrokerNode node, int readTimeoutMs) {
+        this(node, readTimeoutMs, DEFAULT_IDLE_EVICT_MS);
+    }
+
+    /** @param idleEvictMs pooled connections idle longer than this are closed, not reused */
+    public PeerClient(BrokerNode node, int readTimeoutMs, long idleEvictMs) {
         this.node = node;
         this.readTimeoutMs = readTimeoutMs;
+        this.idleEvictMs = idleEvictMs;
     }
 
     public WireMessage request(WireMessage message) throws IOException {
@@ -51,14 +68,26 @@ public final class PeerClient implements Closeable {
             return response;
         } catch (IOException e) {
             connection.close();
+            if (connection.reused) {
+                discardIdleConnections();   // its pool-mates are likely dead too (peer restart)
+            }
             throw e;
         }
     }
 
     private Connection borrow() throws IOException {
         synchronized (idle) {
+            long now = System.nanoTime();
+            idle.removeIf(c -> {
+                boolean expired = now - c.lastUsedNanos > idleEvictMs * 1_000_000L;
+                if (expired) {
+                    c.close();
+                }
+                return expired;
+            });
             Connection pooled = idle.pollFirst();
             if (pooled != null) {
+                pooled.reused = true;
                 return pooled;
             }
         }
@@ -66,6 +95,7 @@ public final class PeerClient implements Closeable {
     }
 
     private void giveBack(Connection connection) {
+        connection.lastUsedNanos = System.nanoTime();
         synchronized (idle) {
             if (!closed && idle.size() < MAX_IDLE_CONNECTIONS) {
                 idle.addFirst(connection);
@@ -73,6 +103,13 @@ public final class PeerClient implements Closeable {
             }
         }
         connection.close();
+    }
+
+    private void discardIdleConnections() {
+        synchronized (idle) {
+            idle.forEach(Connection::close);
+            idle.clear();
+        }
     }
 
     public BrokerNode node() {
@@ -94,6 +131,10 @@ public final class PeerClient implements Closeable {
         private final Socket socket;
         private final DataInputStream in;
         private final DataOutputStream out;
+        /** When this connection was last returned to the pool (for idle eviction). */
+        volatile long lastUsedNanos = System.nanoTime();
+        /** True once it has been taken from the pool at least once (i.e. it may be stale). */
+        volatile boolean reused;
 
         private Connection(Socket socket, DataInputStream in, DataOutputStream out) {
             this.socket = socket;

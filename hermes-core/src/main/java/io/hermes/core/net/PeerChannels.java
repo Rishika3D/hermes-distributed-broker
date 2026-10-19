@@ -70,9 +70,15 @@ public final class PeerChannels implements Closeable {
         if (throttle != null && throttle.allow(System.currentTimeMillis())) {
             int hidden = throttle.takeSuppressed();
             LOG.log(System.Logger.Level.WARNING, "request " + message.type() + " to broker " + brokerId
-                    + " failed: " + failure.getMessage()
+                    + " failed: " + describe(failure)
                     + (hidden > 0 ? " (+" + hidden + " similar suppressed)" : ""));
         }
+    }
+
+    /** Always names the exception: e.g. an EOFException (peer closed the socket) has no message. */
+    static String describe(Throwable failure) {
+        String name = failure.getClass().getSimpleName();
+        return failure.getMessage() == null ? name : name + ": " + failure.getMessage();
     }
 
     @Override
