@@ -1,10 +1,11 @@
 # Hermes
 
 [![CI](https://github.com/Rishika3D/hermes-distributed-broker/actions/workflows/ci.yml/badge.svg)](https://github.com/Rishika3D/hermes-distributed-broker/actions/workflows/ci.yml)
+![License](https://img.shields.io/badge/license-MIT-blue)
 ![Java](https://img.shields.io/badge/Java-21-orange)
-![Spring Boot](https://img.shields.io/badge/Spring%20Boot-3.4-green)
-![Tests](https://img.shields.io/badge/tests-162%20passing-brightgreen)
-![Coverage](https://img.shields.io/badge/coverage-core%2089.4%25%20%7C%20rest%2092.9%25-brightgreen)
+![Spring Boot](https://img.shields.io/badge/Spring%20Boot-3.5-green)
+![Tests](https://img.shields.io/badge/tests-163%20passing-brightgreen)
+![Coverage](https://img.shields.io/badge/coverage-core%2089.5%25%20%7C%20rest%2092.6%25-brightgreen)
 
 A distributed message broker built from first principles in Java: topics, partitions, append-only
 write-ahead-log segments, consistent-hash partition placement, simplified Raft leader election,
@@ -51,6 +52,9 @@ with a hand-rolled binary protocol. The `hermes-core` engine has **zero runtime 
 > the load generator share the same cores and a single SSD, so absolute numbers **understate**
 > dedicated hardware, and run-to-run variance is real (interleaved A/B runs below agree within ~2%;
 > runs hours apart, with different background load such as Spotlight indexing, differed by up to ~50%).
+> **Important:** all *native* numbers are from macOS, where Java's `FileChannel.force` performs a full
+> drive-cache flush (`F_FULLFSYNC`); I measured that at ~325 syncs/s for one writer and ~614/s for 8 on
+> this laptop. A Linux production host with a real disk will differ in either direction.
 > Use the *ratios and bottleneck analysis* as the reliable part. Numbers marked *(earlier session)*
 > were measured under different background load.
 
@@ -96,6 +100,28 @@ not coalesce (only the leader's fsync is shared). Storage-layer proof (`GroupCom
 concurrent appends → 502 fsyncs (8.0× coalescing)**, every offset unique, contiguous and durable.
 The coordination was refactored into its own class this release; an interleaved A/B against the previous
 implementation showed **no performance change** (old 3,359 / 3,330 vs new 3,315 / 3,361 msgs/s).
+
+### Inside Docker on Linux (Docker Desktop VM, kernel 6.12)
+
+The same compose stack that you would deploy (3 brokers, `acks=all`, group commit on, RF=2, API key on):
+
+| Test | Result |
+|---|---|
+| `fsync` on the container's data volume | 3.6 ms single writer; **3,271 syncs/s** with 8 concurrent writers |
+| Keyed batch=1000, 20k msgs, 16 concurrent: 11 runs | **9,100 – 67,000 msgs/s** (median ≈ 24,000); 10 of 11 runs fully acknowledged, 1 lost 10% to timeouts |
+| Spread batch=1000 / batch=100 (one sweep) | 17,157 / 4,704 msgs/s |
+| Hot partition, 32 single-message producers | 82 – 150 msgs/s (p99 up to 9 s on a cold stack) |
+| Idle 75 s, then 14 writes | **14/14 succeed** (was `200 502 502 …` before the stale-connection fix) |
+| 800 simultaneous peer connects (Linux) | before the backlog fix **257 delayed ≥ 1 s**; after: **0** (worst 326 ms) |
+
+**Read this honestly:** Docker Desktop on a laptop is a noisy environment: identical runs differed up to
+~10×, the first sweep right after a restart was far worse than later ones, and I could not attribute the
+bad runs to a single cause (not disk: container fsync is *faster* than native; not GC: pauses p50 ≈ 5.5 ms,
+max 513 ms; not OOM: 0 restarts). What the failures *were*, shown by the new peer-failure warnings, is
+`REPLICATE`/`HEARTBEAT` calls exceeding the 3 s peer timeout. Raising `HERMES_PEER_TIMEOUT_MS` to 15,000
+went 6/6 fully acknowledged vs 5/6 at 3,000: suggestive but **not statistically meaningful**, so treat it as
+a tuning recommendation, not a proven fix. These are **not** production capacity numbers; benchmark on
+your target Linux hardware.
 
 ### Reliability & fault tolerance
 
@@ -347,12 +373,13 @@ ports to loopback, gives each broker a 1 GB memory limit with `MaxRAMPercentage=
 period (longer than the 20 s drain), named volumes for data, and a `/api/health` container healthcheck.
 Put a TLS-terminating reverse proxy in front to expose the REST API or dashboard.
 
-> **Verification status:** this exact compose stack was built and run on Docker Desktop (macOS) and
-> smoke-tested: 4 containers healthy; auth enforced (401/200); produce on broker 1 read back from broker 3;
+> **Verification status:** this exact compose stack was built and run on Docker Desktop (macOS, Linux VM) and
+> smoke-tested (twice: before and after the library/image upgrades): 4 containers healthy; auth enforced (401/200); produce on broker 1 read back from broker 3;
 > a 1,000-record batch (0.27 s); a hard-killed broker (writes to partitions needing it refused, the rest
 > kept working) and its recovery (20/20 writes after restart); a full `down`/`up` with **data and topics
 > preserved on the named volumes**; non-root `hermes` user owning its volume; `docker stop` drained and
-> exited in ~1 s. It was **not** tested on Linux, under sustained load in containers, or with image CVE scanning.
+> exited in ~1 s. The images were Trivy-scanned (see Security). It was **not** run on a bare-metal Linux host, and container
+> load results are noisy (see *Inside Docker on Linux*).
 
 ### Checklist before going live
 
@@ -413,18 +440,30 @@ Put a TLS-terminating reverse proxy in front to expose the REST API or dashboard
 | Protocol fuzzing, 50,000 random frames | 0 crashes / hangs |
 | Oversized request (126 MB, 96 MB heap) | before: broker died; after: rejected, broker alive |
 | Secret scan | no hardcoded secrets |
-| Dependency CVEs | Spring Boot 3.3.5 → 3.4.2: Tomcat 10.1.31 → 10.1.34 (CVE-2024-50379, CVE-2024-56337, CVE-2025-24813), logback 1.5.11 → 1.5.16 (CVE-2024-12798, CVE-2024-12801); all tests green after the bump |
+| Dependency CVEs (Maven) | Upgraded Spring Boot 3.3.5 → **3.5.16**, Tomcat → **10.1.61**, Jackson → **2.21.8** (Spring 6.2.19, Logback 1.5.34); all tests green after each bump |
+| Dependency CVEs (npm) | Next.js 14.2.15 → **15.5.28**, React 19, patched `postcss`/`nanoid`: `npm audit` reports **0** production vulnerabilities |
+| **Container image scan (Trivy, HIGH/CRITICAL)** | Broker image: **9 CRITICAL + 30 HIGH → 0** (with 2 documented exceptions, below). Dashboard image: **4 CRITICAL + 41 HIGH → 0**; 770 MB → 317 MB, Node 22, npm removed from the runtime image |
 | SpotBugs (max effort, low threshold) | 19 findings, 0 critical/high; 1 real null-path bug fixed, the rest triaged (record-exposure style, locks already serialised by callers) |
 | PMD (errorprone + multithreading) | 3 minor findings |
 
-Docker image CVE scanning was **not** run (no scanner/daemon available); add `trivy` or `docker scout` to CI.
+**Accepted risks** (`.trivyignore`, with reasons): CVE-2026-47884 (Spring `XsltView` SSRF/RCE) and
+CVE-2026-47890 (SSE stream corruption with view fragments) are reported as CRITICAL against Spring
+Framework 6.2.x and are fixed only in 7.0.9. Both need features Hermes does not have (it is a REST-only API
+with no view layer or SSE), so they are not reachable. Without the ignore file Trivy still reports these two.
+Closing them properly means migrating to Spring Boot 4 / Framework 7 (roadmap). Re-scan with:
+
+```bash
+docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD/.trivyignore":/.trivyignore:ro \
+  aquasec/trivy:latest image --scanners vuln --severity HIGH,CRITICAL --ignorefile /.trivyignore <image>
+```
 
 ---
 
 ## Testing
 
-**162 tests: 150 Java (JUnit 5), 7 dashboard (`node:test`), 5 Python (`unittest`)**, all passing.
-JaCoCo coverage: **hermes-core 89.4% instructions / 78.6% branches, hermes-rest 92.9% / 79.5%**.
+**163 tests: 151 Java (JUnit 5), 7 dashboard (`node:test`), 5 Python (`unittest`)**, all passing. One Java
+test (`ListenBacklogTest`) runs only on Linux; the full Java suite was also run on a real Linux kernel with
+JDK 21 (151/151). JaCoCo coverage: **hermes-core 89.5% instructions / 78.8% branches, hermes-rest 92.6% / 75.6%**.
 
 ```bash
 mvn verify                                        # Java tests + JaCoCo
@@ -438,7 +477,7 @@ python3 -m unittest discover -s clients/python    # client retry/failover tests
 | Storage / WAL | Real temp files, crash/torn-write recovery, batching = 1 fsync | `PartitionLogTest`, `PartitionLogBatchTest`, `RecordSerdeTest` |
 | Concurrency | Multi-threaded stress; **fault injection** for failed fsyncs | `GroupCommitTest`, `GroupCommitterTest`, `ConnectionCapTest` |
 | Pure logic | Fast deterministic unit tests | `ConsistentHashRingTest`, `PartitionAssignerTest`, `ClusterStateTest`, `BrokerConfigTest`, `LogThrottleTest` |
-| Networking | Stub peers (silent/slow), round-trip and fuzz | `PeerClientTimeoutTest`, `MessageCodecTest`, `FuzzAndAuthTest` |
+| Networking | Stub peers (silent/slow/dropping), listen-backlog burst (Linux), round-trip and fuzz | `PeerClientTimeoutTest`, `PeerClientStaleConnectionTest`, `ListenBacklogTest`, `MessageCodecTest`, `FuzzAndAuthTest` |
 | REST controllers | `@WebMvcTest` slices with the engine mocked | `*ControllerTest` |
 | Filters / config | Isolated unit tests | `ApiKeyFilterTest`, `RequestSizeLimitFilterTest`, `InsecureSettingWarningsTest` |
 | Cluster | Real 3-broker integration: election, forwarding, replication, groups, durability | `ClusterIntegrationTest`, `DurabilityQuorumTest`, `BatchProduceIntegrationTest` |
@@ -478,13 +517,18 @@ Issues found in a project-wide review and while deploying, each with how it was 
 | 11 | Peer failures logged as `failed: null` (an `EOFException` has no message); routine idle closes logged as WARN | Seen in the deployed logs | Failures always name the exception class; idle closes are DEBUG |
 | 12 | **Client mistakes returned 500 + an ERROR stack trace** (unknown route, wrong method, non-numeric path variable, missing parameter), so a typo'd URL would page an operator | 4/4 new tests failed (red) | Handler extends Spring's `ResponseEntityExceptionHandler`: 404 / 405 / 400 with the same `{"error": …}` body |
 
-**Not reproduced.** In earlier cold-start overload runs ~2% of heavy batch requests failed (503 or
+| 13 | **Linux dropped connection bursts**: the server's listen backlog was Java's default 50, so on Linux overflow SYNs were retransmitted a second later and tripped the 1 s connect timeout. macOS hides this, and my first test there wrongly cleared it | New Linux-only test: **423 of 500** simultaneous connects delayed ≥ 900 ms (worst 2.2 s). In the deployed containers: 5 / 50 / 129 / 257 delayed at 100 / 200 / 400 / 800 | Backlog 1,024 (capped by `net.core.somaxconn`). Test green; deployed bursts: **0 delayed** at every size |
+| 14 | **Vulnerable dependencies and images**: Trivy found 9 CRITICAL + 30 HIGH in the broker image and 4 CRITICAL + 41 HIGH in the dashboard image (including Next.js 14.2.15 CVE-2025-29927) | Trivy before/after, `npm audit` | Spring Boot 3.5.16, Tomcat 10.1.61, Jackson 2.21.8, Next.js 15.5.28 + React 19, Node 22 base, npm and an unused Go binary removed from runtime images, OS packages upgraded at build time, `output: standalone`. Two non-reachable Spring CVEs documented in `.trivyignore` |
+| 15 | Compose did not pass `HERMES_PEER_TIMEOUT_MS`; no license | n/a | Exposed in compose and `.env.example`; MIT license added |
+
+**Not reproduced (item 9 context).** In earlier cold-start overload runs ~2% of heavy batch requests failed (503 or
 502); I could not reproduce them in six cold-start runs after item 9 (0 failures at both 3,000 and
 10,000 ms), nor after a connection-burst test (400 simultaneous connects, max 83 ms), so I cannot claim a
 root cause or a fix. The failures occurred right after a Maven build finished, which points to host
 contention. They are now observable (item 9) and clients retry; if you see them in production, start with
-the `failed:` warnings. (Item 10 is a *different* bug, found afterwards, and is not a confirmed
-explanation for these: those runs had no idle period.)
+the `failed:` warnings. (Items 10 and 13 are *different* bugs found afterwards. Item 13 (Linux backlog)
+is a plausible contributor to failures under connection bursts on Linux, but the original failures were
+observed on macOS, where it does not occur, so the cause of those remains unconfirmed.)
 
 ---
 
@@ -509,11 +553,14 @@ Deliberate simplifications and honest gaps (also see `CERTIFICATION.md`):
   durability trade-off); `writeUTF` framing caps values at ~60 KB.
 - **No log retention/compaction:** disks fill; plan for it.
 - **Not verified here:** a 12–24 h soak (a 450 s accelerated soak was run); chaos scenarios needing
-  root (packet loss, disk-full, slow-disk injection, clock skew); image CVE scanning; Linux behaviour
-  (all runs were on macOS, including Docker Desktop); load testing inside containers; replication factor 3.
+  root (packet loss, disk-full, slow-disk injection, clock skew); bare-metal Linux performance (the
+  containers ran in Docker Desktop's VM and were noisy); replication factor 3; a public/internet-facing
+  deployment (only local Docker Compose was deployed).
+- **Two CRITICAL Spring Framework CVEs are accepted, not fixed** (not reachable; see Security).
 
 ### Roadmap
 
+0. Spring Boot 4 / Spring Framework 7 migration, to close the two accepted CVEs.
 1. Follower catch-up via pull-based replication, a prerequisite for (2).
 2. Data-plane leader failover: promote an in-sync replica when a partition leader dies.
 3. Persisted Raft state; batched replication frames; lock-free reads; log retention.
@@ -523,3 +570,7 @@ Deliberate simplifications and honest gaps (also see `CERTIFICATION.md`):
 Each class in `hermes-core` has one responsibility and the package boundaries (`storage`, `cluster`,
 `net`, `raft`, `replication`, `group`, `metrics`, `topic`, `broker`) match the architecture sections
 above. The code is meant to be read.
+
+## License
+
+[MIT](LICENSE) © 2026 Rishika Kherniwal

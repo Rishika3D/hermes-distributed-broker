@@ -10,9 +10,14 @@ COPY hermes-rest/src hermes-rest/src
 RUN mvn -B -q clean package -DskipTests
 
 FROM eclipse-temurin:21-jre
-RUN apt-get update && apt-get install -y --no-install-recommends curl \
+# Patch the base image's OS packages at build time, then add curl for the healthcheck.
+RUN apt-get update && apt-get upgrade -y \
+    && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --home /opt/hermes hermes
+    && useradd --system --home /opt/hermes hermes \
+    # /usr/bin/pebble is a Go service manager shipped in the base image; the broker never runs it,
+    # and its bundled Go stdlib carries HIGH CVEs, so it is removed rather than carried.
+    && rm -f /usr/bin/pebble
 WORKDIR /opt/hermes
 # The data dir must exist and be owned by the runtime user *in the image*: a named volume
 # mounted on a non-existent path is created root-owned, and the non-root broker could not

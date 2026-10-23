@@ -16,6 +16,32 @@
 
   <dependencyManagement>
     <dependencies>
+      <!-- Declared before the BOM import so these win over the BOM-managed Tomcat version
+           (an imported BOM's properties cannot be overridden; its managed versions can). -->
+      <dependency>
+        <groupId>org.apache.tomcat.embed</groupId>
+        <artifactId>tomcat-embed-core</artifactId>
+        <version>${tomcat.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.apache.tomcat.embed</groupId>
+        <artifactId>tomcat-embed-el</artifactId>
+        <version>${tomcat.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.apache.tomcat.embed</groupId>
+        <artifactId>tomcat-embed-websocket</artifactId>
+        <version>${tomcat.version}</version>
+      </dependency>
+      <!-- Newer Jackson than the Spring Boot BOM manages (closes jackson-core/databind CVEs published
+           after that release); declared first so it takes precedence. Stays on the 2.21 line. -->
+      <dependency>
+        <groupId>com.fasterxml.jackson</groupId>
+        <artifactId>jackson-bom</artifactId>
+        <version>${jackson.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
       <dependency>
         <groupId>org.springframework.boot</groupId>
         <artifactId>spring-boot-dependencies</artifactId>

@@ -20,7 +20,10 @@
   <properties>
     <maven.compiler.release>21</maven.compiler.release>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-    <spring-boot.version>3.4.2</spring-boot.version>
+    <spring-boot.version>3.5.16</spring-boot.version>
+    <!-- Newer than the version the Spring Boot BOM manages: closes Tomcat CVEs published after that release. -->
+    <tomcat.version>10.1.61</tomcat.version>
+    <jackson.version>2.21.8</jackson.version>
     <junit.version>5.10.2</junit.version>
   </properties>
 

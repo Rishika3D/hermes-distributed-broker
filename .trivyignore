@@ -1,0 +1,9 @@
+# Accepted risks. Each entry needs a reason; remove it when the dependency is upgraded.
+#
+# Spring Framework 6.2.x, fixed only in 7.0.9 (a major upgrade tracked on the roadmap).
+# Neither vulnerable feature exists in Hermes: it is a REST-only API with no view layer.
+#
+# XsltView SSRF/RCE: requires XSLT view rendering behind a catch-all mapping. No views are used.
+CVE-2026-47884
+# SSE stream corruption with view fragments: requires Server-Sent Events + view fragments. Neither is used.
+CVE-2026-47890

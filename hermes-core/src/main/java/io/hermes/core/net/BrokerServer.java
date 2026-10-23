@@ -27,6 +27,13 @@ public final class BrokerServer implements Closeable {
 
     /** Default ceiling on concurrent connections — sheds load beyond this. */
     public static final int DEFAULT_MAX_CONNECTIONS = 4_096;
+    /**
+     * Pending-connection queue length. Peers open connections in bursts; with Java's default of
+     * 50, Linux drops the overflow SYNs and the client retransmits a full second later, which
+     * trips PeerClient's 1 s connect timeout (500 simultaneous connects: 423 delayed >= 900 ms).
+     * The kernel silently caps this at net.core.somaxconn.
+     */
+    static final int LISTEN_BACKLOG = 1_024;
     /** Idle read timeout; a peer that sends nothing for this long is dropped. */
     private static final int READ_TIMEOUT_MS = 60_000;
 
@@ -52,7 +59,7 @@ public final class BrokerServer implements Closeable {
     }
 
     public void start() throws IOException {
-        serverSocket = new ServerSocket(port);
+        serverSocket = new ServerSocket(port, LISTEN_BACKLOG);
         running = true;
         workers.submit(this::acceptLoop);
     }

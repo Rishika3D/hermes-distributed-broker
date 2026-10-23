@@ -10,6 +10,8 @@ At batch=1 each request carries one message (POST /messages); at batch>1 each
 request carries `batch` messages in one call (POST /messages/batch), which the
 broker appends with a single fsync + one replication frame.
 
+If the brokers require an API key, export HERMES_API_KEY before running (sent as X-API-Key).
+
 Usage:
   python3 benchmarks/bench.py --total 20000 --batch 100 --concurrency 16 \
       --brokers http://localhost:8081,http://localhost:8082,http://localhost:8083 \
@@ -22,8 +24,10 @@ from concurrent.futures import ThreadPoolExecutor
 
 def _post(url, payload, timeout):
     data = json.dumps(payload).encode()
-    req = urllib.request.Request(url, data=data, method="POST",
-                                 headers={"Content-Type": "application/json"})
+    headers = {"Content-Type": "application/json"}
+    if os.environ.get("HERMES_API_KEY"):          # brokers started with HERMES_API_KEY require it
+        headers["X-API-Key"] = os.environ["HERMES_API_KEY"]
+    req = urllib.request.Request(url, data=data, method="POST", headers=headers)
     t = time.perf_counter()
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -88,13 +92,15 @@ def main():
     ap.add_argument("--concurrency", type=int, default=16)
     ap.add_argument("--value-bytes", type=int, default=200)
     ap.add_argument("--timeout", type=float, default=30.0)
+    ap.add_argument("--keyed", action="store_true",
+                    help="give each request's records a shared key so a batch lands in one partition")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
     brokers = [b.strip() for b in args.brokers.split(",") if b.strip()]
     topic = args.topic or f"bench_b{args.batch}_{int(time.time())}"
     result = run(brokers, topic, args.total, args.batch, args.concurrency,
-                 args.value_bytes, args.timeout)
+                 args.value_bytes, args.timeout, keyed=args.keyed)
     print(json.dumps(result, indent=2))
     if args.out:
         os.makedirs(os.path.dirname(args.out), exist_ok=True)
